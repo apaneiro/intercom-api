@@ -17,11 +17,9 @@
 #include <functional>
 #include <vector>
 
-// Forward declare AEC
+// Forward declare AEC processor interface (esp_aec/aec_processor.h)
 namespace esphome {
-namespace esp_aec {
-class EspAec;
-}  // namespace esp_aec
+class AecProcessor;
 }  // namespace esphome
 
 namespace esphome {
@@ -131,7 +129,7 @@ class I2SAudioDuplex : public Component {
   void set_slot_bit_width(uint8_t sbw) { this->slot_bit_width_ = sbw; }
 
   // AEC setter
-  void set_aec(esp_aec::EspAec *aec);
+  void set_aec(AecProcessor *aec);
   void set_aec_enabled(bool enabled) { this->aec_enabled_.store(enabled, std::memory_order_relaxed); }
   bool is_aec_enabled() const { return this->aec_enabled_.load(std::memory_order_relaxed); }
 
@@ -266,7 +264,7 @@ class I2SAudioDuplex : public Component {
   size_t speaker_buffer_size_{0};  // Actual allocated size (scales with decimation_ratio_)
 
   // AEC support
-  esp_aec::EspAec *aec_{nullptr};
+  AecProcessor *aec_{nullptr};
   std::atomic<bool> aec_enabled_{false};  // Runtime toggle (only enabled when aec_ is set)
   std::unique_ptr<RingBuffer> speaker_ref_buffer_;  // Reference for AEC (bus rate in mono mode)
 

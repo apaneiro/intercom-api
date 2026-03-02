@@ -59,9 +59,9 @@ CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
 
-# Forward declare esp_aec
-esp_aec_ns = cg.esphome_ns.namespace("esp_aec")
-EspAec = esp_aec_ns.class_("EspAec")
+# AecProcessor abstract interface (defined in esp_aec/aec_processor.h)
+# Both esp_aec::EspAec and future esp_afe::EspAfe inherit from this.
+AecProcessor = cg.esphome_ns.class_("AecProcessor")
 
 # I2S port count per SoC variant (from SOC_I2S_NUM in soc_caps.h)
 I2S_PORTS = {
@@ -179,7 +179,7 @@ CONFIG_SCHEMA = cv.All(
         # Output sample rate for mic/AEC/MWW/VA (decimated from bus rate)
         # If omitted, equals sample_rate (no decimation)
         cv.Optional(CONF_OUTPUT_SAMPLE_RATE): cv.int_range(min=8000, max=48000),
-        cv.Optional(CONF_AEC_ID): cv.use_id(EspAec),
+        cv.Optional(CONF_AEC_ID): cv.use_id(AecProcessor),
         # AEC reference delay: 80ms for separate I2S, 20-40ms for integrated codecs like ES8311
         cv.Optional(CONF_AEC_REF_DELAY_MS, default=80): cv.int_range(min=10, max=200),
         # Pre-AEC mic attenuation: 0.1 = -20dB (for hot mics like ES8311 that overdrive)

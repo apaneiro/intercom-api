@@ -9,7 +9,7 @@
 #include "esphome/core/log.h"
 
 #ifdef USE_ESP_AEC
-#include "../esp_aec/esp_aec.h"
+#include "../esp_aec/aec_processor.h"
 #endif
 
 namespace esphome {
@@ -122,7 +122,7 @@ void I2SAudioDuplex::setup() {
   ESP_LOGI(TAG, "I2S Audio Duplex ready (speaker_buf=%u bytes)", (unsigned)this->speaker_buffer_size_);
 }
 
-void I2SAudioDuplex::set_aec(esp_aec::EspAec *aec) {
+void I2SAudioDuplex::set_aec(AecProcessor *aec) {
   this->aec_ = aec;
   this->aec_enabled_.store(aec != nullptr, std::memory_order_relaxed);
   // Note: speaker_ref_buffer_ is created in setup() after decimation_ratio_ is computed
