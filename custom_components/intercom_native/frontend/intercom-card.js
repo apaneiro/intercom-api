@@ -50,6 +50,7 @@ class IntercomCard extends HTMLElement {
 
     // Audio streaming active (for P2P)
     this._audioStreaming = false;
+    this._scriptProcessor = null;
 
     // Persistent error message (survives _render() DOM rebuild)
     this._errorMsg = "";
@@ -476,7 +477,7 @@ class IntercomCard extends HTMLElement {
     }
   }
 
-  async _startP2P(deviceInfo) {
+  async _setupMicAndSpeaker() {
     // Setup mic
     this._mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
@@ -489,21 +490,71 @@ class IntercomCard extends HTMLElement {
     );
     if (this._audioContext.state === "suspended") await this._audioContext.resume();
 
-    await this._audioContext.audioWorklet.addModule(`/intercom-native/intercom-processor.js?v=${INTERCOM_CARD_VERSION}`);
     this._source = this._audioContext.createMediaStreamSource(this._mediaStream);
-    this._workletNode = new AudioWorkletNode(this._audioContext, "intercom-processor");
-    this._workletNode.port.onmessage = (e) => {
-      if (e.data.type === "audio") this._sendAudio(new Int16Array(e.data.buffer));
-    };
-    this._source.connect(this._workletNode);
+
+    // Try AudioWorklet first, fall back to ScriptProcessorNode
+    if (this._audioContext.audioWorklet) {
+      try {
+        await this._audioContext.audioWorklet.addModule(`/intercom-native/intercom-processor.js?v=${INTERCOM_CARD_VERSION}`);
+        this._workletNode = new AudioWorkletNode(this._audioContext, "intercom-processor");
+        this._workletNode.port.onmessage = (e) => {
+          if (e.data.type === "audio") this._sendAudio(new Int16Array(e.data.buffer));
+        };
+        this._source.connect(this._workletNode);
+      } catch (_) {
+        this._setupScriptProcessor();
+      }
+    } else {
+      this._setupScriptProcessor();
+    }
 
     // Setup speaker
     this._playbackContext = new (window.AudioContext || window.webkitAudioContext)();
     this._gainNode = this._playbackContext.createGain();
     this._gainNode.gain.value = 1.0;
     this._gainNode.connect(this._playbackContext.destination);
+  }
 
-    // Start session
+  _setupScriptProcessor() {
+    // ScriptProcessorNode fallback for browsers without AudioWorklet (older Android WebView)
+    const bufferSize = 4096;
+    const targetRate = 16000;
+    const inputRate = this._audioContext.sampleRate;
+    const ratio = inputRate / targetRate;
+    let resampleAccum = 0;
+    let pcmBuffer = [];
+    const targetSamples = 1024; // 64ms chunks @ 16kHz
+
+    this._scriptProcessor = this._audioContext.createScriptProcessor(bufferSize, 1, 1);
+    this._scriptProcessor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      // Resample to 16kHz (same algorithm as AudioWorklet)
+      for (let i = 0; i < input.length; i++) {
+        resampleAccum += 1;
+        if (resampleAccum >= ratio) {
+          pcmBuffer.push(input[i]);
+          resampleAccum -= ratio;
+        }
+      }
+      while (pcmBuffer.length >= targetSamples) {
+        const chunk = pcmBuffer.splice(0, targetSamples);
+        const int16 = new Int16Array(chunk.length);
+        for (let i = 0; i < chunk.length; i++) {
+          const s = Math.max(-1, Math.min(1, chunk[i]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        this._sendAudio(int16);
+      }
+      // Output silence (required for ScriptProcessorNode to keep processing)
+      e.outputBuffer.getChannelData(0).fill(0);
+    };
+    this._source.connect(this._scriptProcessor);
+    this._scriptProcessor.connect(this._audioContext.destination);
+  }
+
+  async _startP2P(deviceInfo) {
+    await this._setupMicAndSpeaker();
+
     const result = await this._hass.connection.sendMessagePromise({
       type: "intercom_native/start",
       device_id: deviceInfo.device_id,
@@ -511,7 +562,6 @@ class IntercomCard extends HTMLElement {
     });
     if (!result.success) throw new Error("Start failed");
 
-    // Subscribe to audio events
     this._unsubscribeAudio = await this._hass.connection.subscribeEvents(
       (e) => this._handleAudioEvent(e), "intercom_audio"
     );
@@ -522,36 +572,8 @@ class IntercomCard extends HTMLElement {
   }
 
   async _answerEspCall(deviceInfo) {
-    // Answer an ESP-initiated call (ESP called Home Assistant)
-    // Similar to _startP2P but sends ANSWER instead of START
+    await this._setupMicAndSpeaker();
 
-    // Setup mic
-    this._mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-
-    const track = this._mediaStream.getAudioTracks()[0];
-    const trackSampleRate = track?.getSettings?.().sampleRate;
-    this._audioContext = new (window.AudioContext || window.webkitAudioContext)(
-      trackSampleRate ? { sampleRate: trackSampleRate } : undefined
-    );
-    if (this._audioContext.state === "suspended") await this._audioContext.resume();
-
-    await this._audioContext.audioWorklet.addModule(`/intercom-native/intercom-processor.js?v=${INTERCOM_CARD_VERSION}`);
-    this._source = this._audioContext.createMediaStreamSource(this._mediaStream);
-    this._workletNode = new AudioWorkletNode(this._audioContext, "intercom-processor");
-    this._workletNode.port.onmessage = (e) => {
-      if (e.data.type === "audio") this._sendAudio(new Int16Array(e.data.buffer));
-    };
-    this._source.connect(this._workletNode);
-
-    // Setup speaker
-    this._playbackContext = new (window.AudioContext || window.webkitAudioContext)();
-    this._gainNode = this._playbackContext.createGain();
-    this._gainNode.gain.value = 1.0;
-    this._gainNode.connect(this._playbackContext.destination);
-
-    // Answer ESP call (sends ANSWER, not START)
     const result = await this._hass.connection.sendMessagePromise({
       type: "intercom_native/answer_esp_call",
       device_id: deviceInfo.device_id,
@@ -559,7 +581,6 @@ class IntercomCard extends HTMLElement {
     });
     if (!result.success) throw new Error("Answer failed");
 
-    // Subscribe to audio events
     this._unsubscribeAudio = await this._hass.connection.subscribeEvents(
       (e) => this._handleAudioEvent(e), "intercom_audio"
     );
@@ -707,6 +728,7 @@ class IntercomCard extends HTMLElement {
     if (this._unsubscribeAudio) { this._unsubscribeAudio(); this._unsubscribeAudio = null; }
     if (this._mediaStream) { this._mediaStream.getTracks().forEach(t => t.stop()); this._mediaStream = null; }
     if (this._workletNode) { this._workletNode.disconnect(); this._workletNode = null; }
+    if (this._scriptProcessor) { this._scriptProcessor.disconnect(); this._scriptProcessor = null; }
     if (this._source) { this._source.disconnect(); this._source = null; }
     if (this._audioContext) { await this._audioContext.close().catch(() => {}); this._audioContext = null; }
     if (this._playbackContext) { await this._playbackContext.close().catch(() => {}); this._playbackContext = null; }

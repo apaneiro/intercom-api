@@ -29,6 +29,16 @@
 # I2S bus at 48kHz (ES8311 native), mic decimated to 16kHz via FIR filter.
 # Wake word ALWAYS active. Mode switching is UI-only (display + buttons).
 #
+# Audio pipeline (i2s_audio_duplex at 48kHz, stereo AEC reference):
+#
+#   I2S RX 48kHz stereo → L=ref R=mic → FIR x3 ──┐
+#                                                ├── AEC → mic_aec → VA / Intercom TX
+#                                                └── mic_raw (pre-AEC) → MWW
+#
+#   TTS/media (16kHz) → va_speaker (resampler 16→48k) ───┐
+#                                                        ├── mixer (48kHz) → hw_speaker → ES8311
+#   Intercom RX (16kHz) → intercom_speaker (resampler) ──┘
+#
 # GPIO0 Button Behavior (page-aware):
 #   VA idle:           Click=start VA | Long press(1-3s)=switch to intercom
 #   VA active:         Click=stop VA
