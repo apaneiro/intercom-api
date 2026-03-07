@@ -37,6 +37,11 @@ _sessions: Dict[str, "IntercomSession"] = {}
 # Active bridges: bridge_id -> BridgeSession
 _bridges: Dict[str, "BridgeSession"] = {}
 
+# Audio subscribers: device_id -> set of (connection, msg_id)
+# Used by subscribe_audio WS command to push audio directly to clients
+# without going through event bus (which requires admin privileges)
+_audio_subscribers: Dict[str, set] = {}
+
 
 class IntercomSession:
     """Manages a single intercom session between browser and ESP."""
@@ -61,16 +66,19 @@ class IntercomSession:
     # --- Callbacks for TCP client (shared by start() and answer_esp_call()) ---
 
     def _on_audio(self, data: bytes) -> None:
-        """Handle audio from ESP - fire event to browser."""
+        """Handle audio from ESP - push to subscribed WS connections."""
         if not self._active:
             return
-        self.hass.bus.async_fire(
-            "intercom_audio",
-            {
-                "device_id": self.device_id,
-                "audio": base64.b64encode(data).decode("ascii"),
-            }
-        )
+        subs = _audio_subscribers.get(self.device_id)
+        if not subs:
+            return
+        audio_b64 = base64.b64encode(data).decode("ascii")
+        payload = {"device_id": self.device_id, "audio": audio_b64}
+        for connection, msg_id in list(subs):
+            try:
+                connection.send_event(msg_id, payload)
+            except Exception:
+                subs.discard((connection, msg_id))
 
     def _on_disconnected(self) -> None:
         self._active = False
@@ -571,6 +579,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_bridge)
     websocket_api.async_register_command(hass, websocket_bridge_stop)
     websocket_api.async_register_command(hass, websocket_decline)
+    websocket_api.async_register_command(hass, websocket_subscribe_audio)
 
 
 @websocket_api.websocket_command(
@@ -992,6 +1001,7 @@ async def websocket_bridge_stop(
     connection.send_result(msg_id, {"success": True})
 
 
+WS_TYPE_SUBSCRIBE_AUDIO = f"{DOMAIN}/subscribe_audio"
 WS_TYPE_DECLINE = f"{DOMAIN}/decline"
 
 
@@ -1019,6 +1029,41 @@ async def websocket_decline(
 
     stopped = await _stop_device_sessions(device_id)
     connection.send_result(msg_id, {"success": True, "stopped": stopped})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_SUBSCRIBE_AUDIO,
+        vol.Required("device_id"): str,
+    }
+)
+@callback
+def websocket_subscribe_audio(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: Dict[str, Any],
+) -> None:
+    """Subscribe to audio stream for a device.
+
+    Pushes audio directly to the WS connection instead of via event bus,
+    so non-admin users can receive intercom audio.
+    """
+    device_id = msg["device_id"]
+    msg_id = msg["id"]
+
+    sub_entry = (connection, msg_id)
+    _audio_subscribers.setdefault(device_id, set()).add(sub_entry)
+
+    @callback
+    def unsub() -> None:
+        subs = _audio_subscribers.get(device_id)
+        if subs:
+            subs.discard(sub_entry)
+            if not subs:
+                _audio_subscribers.pop(device_id, None)
+
+    connection.subscriptions[msg_id] = unsub
+    connection.send_result(msg_id)
 
 
 async def start_auto_bridge(hass: HomeAssistant, intercom_state_entity_id: str) -> None:

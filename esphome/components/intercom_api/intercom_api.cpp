@@ -11,17 +11,10 @@
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+#include "../esp_aec/audio_utils.h"
 
 namespace esphome {
 namespace intercom_api {
-
-// Scale a 16-bit sample by a float gain with saturation clamping
-static inline int16_t scale_sample(int16_t sample, float gain) {
-  int32_t s = static_cast<int32_t>(sample * gain);
-  if (s > 32767) return 32767;
-  if (s < -32768) return -32768;
-  return static_cast<int16_t>(s);
-}
 
 static const char *const TAG = "intercom_api";
 
@@ -56,13 +49,24 @@ void IntercomApi::setup() {
     return;
   }
 
-  // Allocate frame buffers
+  // Allocate frame buffers (internal RAM — intercom_api must work on devices without PSRAM)
   this->tx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
   this->rx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
   this->audio_tx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
 
   if (!this->tx_buffer_ || !this->rx_buffer_ || !this->audio_tx_buffer_) {
     ESP_LOGE(TAG, "Failed to allocate frame buffers");
+    this->mark_failed();
+    return;
+  }
+
+  // Pre-allocate audio processing buffers (avoid stack VLAs on 8KB FreeRTOS tasks)
+  static constexpr size_t MIC_BUF_SAMPLES = 512;  // MAX_SAMPLES in on_microphone_data_
+  static constexpr size_t SPK_BUF_SAMPLES = AUDIO_CHUNK_SIZE * 4 / sizeof(int16_t);  // 1024
+  this->mic_converted_ = static_cast<int16_t *>(heap_caps_malloc(MIC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL));
+  this->spk_ref_scaled_ = static_cast<int16_t *>(heap_caps_malloc(SPK_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL));
+  if (!this->mic_converted_ || !this->spk_ref_scaled_) {
+    ESP_LOGE(TAG, "Failed to allocate audio processing buffers");
     this->mark_failed();
     return;
   }
@@ -445,12 +449,15 @@ void IntercomApi::reset_aec_buffers_() {
     // Pre-fill reference buffer with silence to create delay
     // This compensates for I2S DMA latency + acoustic delay
     // The mic captures echo from audio played ~80ms ago, so we delay the reference
-    auto *silence = static_cast<uint8_t *>(heap_caps_calloc(1, AEC_REF_DELAY_BYTES, MALLOC_CAP_INTERNAL));
-    if (silence) {
-      this->spk_ref_buffer_->write(silence, AEC_REF_DELAY_BYTES);
-      heap_caps_free(silence);
-      ESP_LOGD(TAG, "AEC buffers reset, pre-filled %ums silence", static_cast<unsigned>(AEC_REF_DELAY_MS));
+    // Use stack-based loop instead of heap allocation for the silence block
+    uint8_t zeros[256] = {};
+    size_t remaining = AEC_REF_DELAY_BYTES;
+    while (remaining > 0) {
+      size_t chunk = std::min(remaining, sizeof(zeros));
+      this->spk_ref_buffer_->write(zeros, chunk);
+      remaining -= chunk;
     }
+    ESP_LOGD(TAG, "AEC buffers reset, pre-filled %ums silence", static_cast<unsigned>(AEC_REF_DELAY_MS));
     xSemaphoreGive(this->spk_ref_mutex_);
   }
 }
@@ -1083,15 +1090,14 @@ void IntercomApi::speaker_task_() {
       // IMPORTANT: Apply same volume scaling as speaker output so reference matches actual echo
       if (this->aec_enabled_ && this->spk_ref_buffer_ != nullptr) {
         if (xSemaphoreTake(this->spk_ref_mutex_, pdMS_TO_TICKS(2)) == pdTRUE) {
-          // Use separate buffer for scaled reference (don't modify audio_chunk!)
+          // Use pre-allocated buffer for scaled reference (don't modify audio_chunk!)
           if (this->volume_ != 1.0f) {
-            int16_t ref_scaled[AUDIO_CHUNK_SIZE * 4 / sizeof(int16_t)];
             const int16_t *src = reinterpret_cast<const int16_t *>(audio_chunk);
             size_t num_samples = read / sizeof(int16_t);
             for (size_t i = 0; i < num_samples; i++) {
-              ref_scaled[i] = scale_sample(src[i], this->volume_);
+              this->spk_ref_scaled_[i] = scale_sample(src[i], this->volume_);
             }
-            this->spk_ref_buffer_->write(ref_scaled, read);
+            this->spk_ref_buffer_->write(this->spk_ref_scaled_, read);
           } else {
             this->spk_ref_buffer_->write(audio_chunk, read);
           }
@@ -1544,18 +1550,17 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
 
   // RingBuffer is thread-safe, no mutex needed
   if (needs_processing) {
-    int16_t converted[MAX_SAMPLES];
-
     for (size_t i = 0; i < num_samples; i++) {
-      int16_t s = src[i];
+      int32_t s = src[i];
       if (this->dc_offset_removal_) {
-        this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + s;
-        s = static_cast<int16_t>(s - (this->dc_offset_ >> 8));
+        // IIR high-pass ~2.5Hz cutoff at 16kHz (matches i2s_audio_duplex)
+        this->dc_offset_ += (s - this->dc_offset_) >> 10;
+        s = s - this->dc_offset_;
       }
-      converted[i] = scale_sample(s, this->mic_gain_);
+      this->mic_converted_[i] = scale_sample(static_cast<int16_t>(s), this->mic_gain_);
     }
 
-    this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
+    this->mic_buffer_->write(this->mic_converted_, num_samples * sizeof(int16_t));
   } else {
     // Direct passthrough (gain=1.0, no DC offset)
     this->mic_buffer_->write(data, len);

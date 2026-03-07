@@ -11,7 +11,7 @@
  * - Streaming  -> Show "In Call [peer]" + Hangup
  */
 
-const INTERCOM_CARD_VERSION = "2.1.2";
+const INTERCOM_CARD_VERSION = "2.1.3";
 
 class IntercomCard extends HTMLElement {
   constructor() {
@@ -516,8 +516,9 @@ class IntercomCard extends HTMLElement {
     });
     if (!result.success) throw new Error("Start failed");
 
-    this._unsubscribeAudio = await this._hass.connection.subscribeEvents(
-      (e) => this._handleAudioEvent(e), "intercom_audio"
+    this._unsubscribeAudio = await this._hass.connection.subscribeMessage(
+      (msg) => this._handleAudioMessage(msg),
+      { type: "intercom_native/subscribe_audio", device_id: deviceInfo.device_id }
     );
 
     this._audioStreaming = true;
@@ -535,8 +536,9 @@ class IntercomCard extends HTMLElement {
     });
     if (!result.success) throw new Error("Answer failed");
 
-    this._unsubscribeAudio = await this._hass.connection.subscribeEvents(
-      (e) => this._handleAudioEvent(e), "intercom_audio"
+    this._unsubscribeAudio = await this._hass.connection.subscribeMessage(
+      (msg) => this._handleAudioMessage(msg),
+      { type: "intercom_native/subscribe_audio", device_id: deviceInfo.device_id }
     );
 
     this._audioStreaming = true;
@@ -729,16 +731,16 @@ class IntercomCard extends HTMLElement {
     if (this._chunksSent % 25 === 0) this._updateStats();
   }
 
-  _handleAudioEvent(event) {
-    if (!event.data || !this._activeDeviceInfo) return;
-    if (event.data.device_id !== this._activeDeviceInfo.device_id) return;
+  _handleAudioMessage(msg) {
+    if (!msg || !this._activeDeviceInfo) return;
+    if (msg.device_id !== this._activeDeviceInfo.device_id) return;
     if (!this._audioStreaming || !this._playbackContext) return;
 
     this._chunksReceived++;
     if (this._chunksReceived % 50 === 0) this._updateStats();
 
     try {
-      const binary = atob(event.data.audio);
+      const binary = atob(msg.audio);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 

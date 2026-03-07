@@ -359,6 +359,10 @@ class IntercomApi : public Component {
   bool dc_offset_removal_{false}; // Enable for mics with DC bias (SPH0645)
   int32_t dc_offset_{0};          // Running DC offset value
 
+  // Pre-allocated processing buffers (avoid stack VLAs on FreeRTOS tasks)
+  int16_t *mic_converted_{nullptr};     // Mic callback processing (MAX_SAMPLES = 512 samples)
+  int16_t *spk_ref_scaled_{nullptr};    // Speaker AEC ref scaling (AUDIO_CHUNK_SIZE*4/2 = 1024 samples)
+
 #ifdef USE_ESP_AEC
   // AEC (Acoustic Echo Cancellation)
   esp_aec::EspAec *aec_{nullptr};

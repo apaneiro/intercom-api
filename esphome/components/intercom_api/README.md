@@ -261,9 +261,73 @@ Navigate contact list (Full mode only).
     id: intercom
 ```
 
+### intercom_api.set_contact
+
+Select a specific contact by name and optionally start a call. This is the key building block for **GPIO-triggered calls** — each button can call a different device.
+
+```yaml
+- intercom_api.set_contact:
+    id: intercom
+    contact: "Waveshare S3 Audio"
+```
+
+> **Important: Name matching is exact (case-sensitive).** The `contact` value must match the device name exactly as it appears in the contacts list. The contacts list is populated from the `name:` substitution in each device's YAML. For example, if the target device has `substitutions: name: waveshare-s3-audio`, then the contact name in Home Assistant will be `Waveshare S3 Audio` (HA converts hyphens to spaces and capitalizes words). Always verify the exact name in the `sensor.{name}_destination` entity.
+
+#### Example: Multi-Button Intercom (Apartment Doorbell)
+
+Each GPIO button calls a different room — like a condominium intercom panel:
+
+```yaml
+binary_sensor:
+  # Button 1: Call Kitchen
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - intercom_api.set_contact:
+          id: intercom
+          contact: "Kitchen Intercom"
+      - intercom_api.start:
+          id: intercom
+
+  # Button 2: Call Living Room
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - intercom_api.set_contact:
+          id: intercom
+          contact: "Living Room Intercom"
+      - intercom_api.start:
+          id: intercom
+
+  # Button 3: Call Bedroom
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      - intercom_api.set_contact:
+          id: intercom
+          contact: "Bedroom Intercom"
+      - intercom_api.start:
+          id: intercom
+```
+
+Each device name must match the target device's YAML `substitutions.name` exactly as displayed in HA. For example:
+- YAML: `name: kitchen-intercom` → HA device name: `Kitchen Intercom` → contact: `"Kitchen Intercom"`
+- YAML: `name: waveshare-s3-audio` → HA device name: `Waveshare S3 Audio` → contact: `"Waveshare S3 Audio"`
+
+If `set_contact` fails to find the name, it fires `on_call_failed` with `"Contact not found: <name>"`.
+
 ### intercom_api.set_contacts
 
-Update contact list from CSV string.
+Update contact list from CSV string. Normally handled automatically by the `sensor.intercom_active_devices` sensor.
 
 ```yaml
 text_sensor:

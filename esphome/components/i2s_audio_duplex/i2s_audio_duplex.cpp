@@ -11,19 +11,12 @@
 #ifdef USE_ESP_AEC
 #include "../esp_aec/aec_processor.h"
 #endif
+#include "../esp_aec/audio_utils.h"
 
 namespace esphome {
 namespace i2s_audio_duplex {
 
 static constexpr size_t BYTES_PER_SAMPLE = 2;
-
-// Scale a 16-bit sample by a float gain with saturation clamping
-static inline int16_t scale_sample(int16_t sample, float gain) {
-  int32_t s = static_cast<int32_t>(sample * gain);
-  if (s > 32767) return 32767;
-  if (s < -32768) return -32768;
-  return static_cast<int16_t>(s);
-}
 
 static const char *const TAG = "i2s_duplex";
 
@@ -482,7 +475,7 @@ void I2SAudioDuplex::start() {
       "i2s_duplex",
       8192,
       this,
-      19,  // Match ESPHome stock speaker prio; above lwIP(18), below Event Loop(20)
+      12,  // Below lwIP(18) and Event Loop(20); I2S DMA provides ~32ms buffering
       &this->audio_task_handle_,
       0   // Core 0: canonical Espressif AEC pattern; frees Core 1 for MWW inference
   );
@@ -654,9 +647,10 @@ void I2SAudioDuplex::audio_task_() {
       heap_caps_malloc(rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
   // mic_buffer: holds output-rate mic data (decimated or direct)
+  // PSRAM-safe: not DMA, not ISR — all devices using duplex have PSRAM
   bool mic_separate = (ratio > 1) || this->use_stereo_aec_ref_ || this->use_tdm_ref_;
   int16_t *mic_buffer = mic_separate
-      ? static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL))
+      ? static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_DEFAULT))
       : rx_buffer;  // mono, no decimation: alias rx_buffer
 
   // spk_buffer: DMA-capable, TX output at bus rate (read from ring buffer, write to I2S)
@@ -665,25 +659,26 @@ void I2SAudioDuplex::audio_task_() {
       heap_caps_malloc(bus_frame_size * num_ch * i2s_bps, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
   // spk_ref_buffer: output-rate AEC reference (from stereo/TDM split or mono ring buffer after decimation)
+  // PSRAM-safe: processing buffers, not DMA
   int16_t *spk_ref_buffer = nullptr;
   if (this->use_stereo_aec_ref_ || this->use_tdm_ref_) {
-    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
+    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_DEFAULT));
   }
 
   // Intermediate 48kHz buffers for stereo deinterleave before decimation
   int16_t *deint_ref = nullptr;
   int16_t *deint_mic = nullptr;
   if (this->use_stereo_aec_ref_ && ratio > 1) {
-    deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_DEFAULT));
+    deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_DEFAULT));
   }
 
   // TDM buffers: intermediate deinterleave at bus rate (only when TDM + decimation)
   int16_t *tdm_deint_mic = nullptr;
   int16_t *tdm_deint_ref = nullptr;
   if (this->use_tdm_ref_ && ratio > 1) {
-    tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_DEFAULT));
+    tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_DEFAULT));
   }
 
   // TDM TX buffer: expanded frame with all slots (speaker data in slot 0, zeros in 1-3)
@@ -701,12 +696,13 @@ void I2SAudioDuplex::audio_task_() {
 
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
+    // PSRAM-safe: AEC processing buffers, not DMA. ESP-SR aec_process() accepts any heap pointer.
     if (!spk_ref_buffer && !this->use_tdm_ref_)
-      spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
-    aec_output = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
+      spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_DEFAULT));
+    aec_output = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_DEFAULT));
     // For mono mode: need temp buffer for bus-rate ref read from ring buffer
     if (!this->use_stereo_aec_ref_ && !this->use_tdm_ref_) {
-      ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+      ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_DEFAULT));
     }
   }
 #endif
