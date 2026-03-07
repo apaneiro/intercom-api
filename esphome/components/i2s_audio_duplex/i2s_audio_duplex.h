@@ -28,9 +28,13 @@ namespace i2s_audio_duplex {
 // Maximum listener count for microphone/speaker reference counting
 static constexpr UBaseType_t MAX_LISTENERS = 16;
 
-// Callback type for mic data: receives raw PCM samples (pointer + length, zero-copy)
+// Callback type for mic data: receives raw PCM samples (pointer + length, zero-copy).
+// IMPORTANT: Callbacks are invoked from the audio task (high priority, Core 0).
+// They MUST NOT block, allocate memory, do network I/O, or hold locks.
+// Target completion: <1ms to avoid I2S DMA underruns.
 using MicDataCallback = std::function<void(const uint8_t *data, size_t len)>;
-// Callback type for speaker output: reports frames played and timestamp (for mixer pending_playback tracking)
+// Callback type for speaker output: reports frames played and timestamp (for mixer pending_playback tracking).
+// Same real-time constraints as MicDataCallback apply.
 using SpeakerOutputCallback = std::function<void(uint32_t frames, int64_t timestamp)>;
 
 // FIR coefficients: 32-tap (31 original + 1 zero pad), cutoff=7500Hz, fs=48kHz, Kaiser beta=8.0
@@ -133,19 +137,19 @@ class I2SAudioDuplex : public Component {
   void set_aec_enabled(bool enabled) { this->aec_enabled_.store(enabled, std::memory_order_relaxed); }
   bool is_aec_enabled() const { return this->aec_enabled_.load(std::memory_order_relaxed); }
 
-  // Volume control (0.0 - 1.0)
-  void set_mic_gain(float gain) { this->mic_gain_ = gain; }
-  float get_mic_gain() const { return this->mic_gain_; }
+  // Volume control (0.0 - 1.0). Atomic: written from main loop, read from audio task.
+  void set_mic_gain(float gain) { this->mic_gain_.store(gain, std::memory_order_relaxed); }
+  float get_mic_gain() const { return this->mic_gain_.load(std::memory_order_relaxed); }
 
   // Pre-AEC mic attenuation - for hot mics like ES8311 that overdrive
-  void set_mic_attenuation(float atten) { this->mic_attenuation_ = atten; }
-  float get_mic_attenuation() const { return this->mic_attenuation_; }
-  void set_speaker_volume(float volume) { this->speaker_volume_ = volume; }
-  float get_speaker_volume() const { return this->speaker_volume_; }
+  void set_mic_attenuation(float atten) { this->mic_attenuation_.store(atten, std::memory_order_relaxed); }
+  float get_mic_attenuation() const { return this->mic_attenuation_.load(std::memory_order_relaxed); }
+  void set_speaker_volume(float volume) { this->speaker_volume_.store(volume, std::memory_order_relaxed); }
+  float get_speaker_volume() const { return this->speaker_volume_.load(std::memory_order_relaxed); }
 
   // AEC reference volume - for codecs with hardware volume (ES8311)
-  void set_aec_reference_volume(float volume) { this->aec_ref_volume_ = volume; }
-  float get_aec_reference_volume() const { return this->aec_ref_volume_; }
+  void set_aec_reference_volume(float volume) { this->aec_ref_volume_.store(volume, std::memory_order_relaxed); }
+  float get_aec_reference_volume() const { return this->aec_ref_volume_.load(std::memory_order_relaxed); }
 
   // AEC reference delay - acoustic path delay in milliseconds
   void set_aec_reference_delay_ms(uint32_t delay_ms) { this->aec_ref_delay_ms_ = delay_ms; }
@@ -202,6 +206,11 @@ class I2SAudioDuplex : public Component {
   size_t get_speaker_buffer_available() const;
   size_t get_speaker_buffer_size() const;
 
+  // Task configuration (settable from YAML)
+  void set_task_priority(uint8_t prio) { this->task_priority_ = prio; }
+  void set_task_core(int8_t core) { this->task_core_ = core; }
+  void set_task_stack_size(uint32_t size) { this->task_stack_size_ = size; }
+
  protected:
   bool init_i2s_duplex_();
   void deinit_i2s_();
@@ -209,6 +218,67 @@ class I2SAudioDuplex : public Component {
 
   static void audio_task(void *param);
   void audio_task_();
+
+  // Audio task context: groups all buffers, sizes, and per-frame snapshots
+  // to avoid long parameter lists in the refactored processing functions.
+  struct AudioTaskCtx {
+    // ── Invariants (set once at task start) ──
+    uint32_t ratio{1};
+    uint8_t i2s_bps{2};       // 2 or 4 bytes per I2S sample
+    uint8_t num_ch{1};        // TX channels
+    bool use_stereo_aec_ref{false};
+    bool use_tdm_ref{false};
+    bool ref_channel_right{false};
+    bool correct_dc_offset{false};
+    uint8_t tdm_total_slots{0};
+    uint8_t tdm_mic_slot{0};
+    uint8_t tdm_ref_slot{0};
+
+    // ── Frame sizing ──
+    size_t out_frame_size{0};
+    size_t bus_frame_size{0};
+    size_t out_frame_bytes{0};
+    size_t bus_frame_bytes{0};
+    size_t rx_frame_bytes{0};
+    size_t tdm_tx_frame_bytes{0};
+    size_t aec_delay_bytes{0};
+
+    // ── Working buffers (heap-allocated, owned by audio_task_) ──
+    int16_t *rx_buffer{nullptr};
+    int16_t *mic_buffer{nullptr};
+    int16_t *spk_buffer{nullptr};
+    int16_t *spk_ref_buffer{nullptr};
+    int16_t *deint_ref{nullptr};
+    int16_t *deint_mic{nullptr};
+    int16_t *tdm_deint_mic{nullptr};
+    int16_t *tdm_deint_ref{nullptr};
+    int16_t *tdm_tx_buffer{nullptr};
+    int16_t *ref_bus_buffer{nullptr};
+    int16_t *aec_output{nullptr};
+
+    // ── Loop mutable state ──
+    int consecutive_i2s_errors{0};
+    int32_t dc_prev_input{0};
+    int32_t dc_prev_output{0};
+    int16_t *output_buffer{nullptr};  // points to mic_buffer or aec_output
+    bool mic_separate{false};         // true if mic_buffer != rx_buffer
+
+    // ── Per-iteration snapshots from atomics ──
+    float mic_gain{1.0f};
+    float mic_attenuation{1.0f};
+    float speaker_volume{1.0f};
+    float aec_ref_volume{1.0f};
+    bool aec_enabled{false};
+    bool speaker_running{false};
+    bool speaker_paused{false};
+    bool mic_running{false};
+    uint32_t now_ms{0};
+  };
+
+  // Refactored audio processing functions (called from audio_task_ main loop)
+  void process_rx_path_(AudioTaskCtx &ctx);
+  void process_aec_and_callbacks_(AudioTaskCtx &ctx);
+  void process_tx_path_(AudioTaskCtx &ctx);
 
   // Pin configuration
   int lrclk_pin_{-1};
@@ -268,11 +338,11 @@ class I2SAudioDuplex : public Component {
   std::atomic<bool> aec_enabled_{false};  // Runtime toggle (only enabled when aec_ is set)
   std::unique_ptr<RingBuffer> speaker_ref_buffer_;  // Reference for AEC (bus rate in mono mode)
 
-  // Volume control
-  float mic_gain_{1.0f};         // 0.0 - 2.0 (1.0 = unity gain, applied AFTER AEC)
-  float mic_attenuation_{1.0f};  // Pre-AEC attenuation for hot mics (0.1 = -20dB, applied BEFORE AEC)
-  float speaker_volume_{1.0f};   // 0.0 - 1.0 (for digital volume, keep 1.0 if codec has hardware volume)
-  float aec_ref_volume_{1.0f};   // AEC reference scaling (set to codec's output volume for proper echo matching)
+  // Volume control — atomic: written from main loop, read from audio task via snapshot.
+  std::atomic<float> mic_gain_{1.0f};         // 0.0 - 2.0 (1.0 = unity gain, applied AFTER AEC)
+  std::atomic<float> mic_attenuation_{1.0f};  // Pre-AEC attenuation for hot mics (0.1 = -20dB, applied BEFORE AEC)
+  std::atomic<float> speaker_volume_{1.0f};   // 0.0 - 1.0 (for digital volume, keep 1.0 if codec has hardware volume)
+  std::atomic<float> aec_ref_volume_{1.0f};   // AEC reference scaling (set to codec's output volume for proper echo matching)
   uint32_t aec_ref_delay_ms_{80}; // AEC reference delay in ms (80 for separate I2S, 20-40 for ES8311)
   bool use_stereo_aec_ref_{false}; // ES8311 digital feedback: RX stereo with L=ref, R=mic
   bool ref_channel_right_{false};  // Which channel is AEC reference: false=L, true=R
@@ -284,8 +354,13 @@ class I2SAudioDuplex : public Component {
   uint8_t tdm_ref_slot_{1};    // TDM slot index for AEC reference
 
   // AEC gating: only run echo canceller while speaker has recent real audio.
-  uint32_t last_speaker_audio_ms_{0};
+  std::atomic<uint32_t> last_speaker_audio_ms_{0};
   static constexpr uint32_t AEC_ACTIVE_TIMEOUT_MS{250};
+
+  // Task configuration (defaults match ESP-IDF audio best practices)
+  uint8_t task_priority_{19};     // Above lwIP(18), below WiFi(23)
+  int8_t task_core_{0};           // Core 0: canonical Espressif AEC pattern; -1 = unpinned
+  uint32_t task_stack_size_{8192};
 
   // Error propagation: set by audio_task_ on persistent I2S failures
   std::atomic<bool> has_i2s_error_{false};

@@ -35,6 +35,10 @@ void I2SAudioDuplexMicrophone::setup() {
   // AudioStreamInfo constructor: (bits_per_sample, channels, sample_rate)
   this->audio_stream_info_ = audio::AudioStreamInfo(16, 1, this->parent_->get_output_sample_rate());
 
+  // Pre-allocate callback buffer to avoid heap allocation in the RT audio task.
+  // 2048 bytes covers worst case (1024 samples mono 16-bit, no decimation).
+  this->audio_buffer_.reserve(2048);
+
   // Register callback with the parent I2SAudioDuplex to receive mic data
   // pre_aec=true: raw mic for wake word detection (not suppressed by AEC)
   // pre_aec=false: AEC-processed mic for voice assistant STT

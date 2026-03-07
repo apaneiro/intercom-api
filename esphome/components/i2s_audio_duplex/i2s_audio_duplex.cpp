@@ -160,6 +160,8 @@ void I2SAudioDuplex::dump_config() {
                   this->tdm_total_slots_, this->tdm_mic_slot_, this->tdm_ref_slot_);
   }
   ESP_LOGCONFIG(TAG, "  AEC: %s", this->aec_ != nullptr ? "enabled" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Task: priority=%u, core=%d, stack=%u",
+                this->task_priority_, this->task_core_, (unsigned)this->task_stack_size_);
 }
 
 bool I2SAudioDuplex::init_i2s_duplex_() {
@@ -422,7 +424,7 @@ void I2SAudioDuplex::prefill_aec_ref_buffer_() {
       this->aec_ref_delay_ms_ > 0 && !this->use_stereo_aec_ref_ && !this->use_tdm_ref_) {
     this->speaker_ref_buffer_->reset();
     size_t delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
-    uint8_t silence[512] = {};
+    static constexpr uint8_t silence[64] = {};
     size_t remaining = delay_bytes;
     while (remaining > 0) {
       size_t chunk = std::min(remaining, sizeof(silence));
@@ -473,11 +475,11 @@ void I2SAudioDuplex::start() {
   BaseType_t task_created = xTaskCreatePinnedToCore(
       audio_task,
       "i2s_duplex",
-      8192,
+      this->task_stack_size_,
       this,
-      19,  // Above lwIP(18): must not miss I2S DMA frames — MWW needs continuous audio
+      this->task_priority_,
       &this->audio_task_handle_,
-      0   // Core 0: canonical Espressif AEC pattern; frees Core 1 for MWW inference
+      this->task_core_ >= 0 ? this->task_core_ : tskNO_AFFINITY
   );
 
   if (task_created != pdPASS) {
@@ -581,7 +583,7 @@ size_t I2SAudioDuplex::play(const uint8_t *data, size_t len, TickType_t ticks_to
   size_t written = this->speaker_buffer_->write_without_replacement((void *) data, len, ticks_to_wait, true);
 
   if (written > 0) {
-    this->last_speaker_audio_ms_ = millis();
+    this->last_speaker_audio_ms_.store(millis(), std::memory_order_relaxed);
   }
 
 #ifdef USE_ESP_AEC
@@ -603,488 +605,457 @@ void I2SAudioDuplex::audio_task(void *param) {
 }
 
 void I2SAudioDuplex::audio_task_() {
-  const uint32_t ratio = this->decimation_ratio_;
+  AudioTaskCtx ctx{};
+
+  // ── Populate invariants ──
+  ctx.ratio = this->decimation_ratio_;
+  ctx.i2s_bps = (this->bits_per_sample_ > 16) ? 4 : 2;
+  ctx.num_ch = this->num_channels_;
+  ctx.use_stereo_aec_ref = this->use_stereo_aec_ref_;
+  ctx.use_tdm_ref = this->use_tdm_ref_;
+  ctx.ref_channel_right = this->ref_channel_right_;
+  ctx.correct_dc_offset = this->correct_dc_offset_;
+  ctx.tdm_total_slots = this->tdm_total_slots_;
+  ctx.tdm_mic_slot = this->tdm_mic_slot_;
+  ctx.tdm_ref_slot = this->tdm_ref_slot_;
+
   ESP_LOGD(TAG, "Audio task started (stereo=%s, tdm=%s, decimation=%ux)",
-           this->use_stereo_aec_ref_ ? "YES" : "no",
-           this->use_tdm_ref_ ? "YES" : "no", (unsigned)ratio);
+           ctx.use_stereo_aec_ref ? "YES" : "no",
+           ctx.use_tdm_ref ? "YES" : "no", (unsigned)ctx.ratio);
 
   // Determine output frame size: use AEC's required chunk size if available, otherwise default.
-  size_t out_frame_size = DEFAULT_FRAME_SIZE;
+  ctx.out_frame_size = DEFAULT_FRAME_SIZE;
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr && this->aec_->is_initialized()) {
-    out_frame_size = this->aec_->get_frame_size();
+    ctx.out_frame_size = this->aec_->get_frame_size();
     uint32_t out_rate = this->get_output_sample_rate();
     ESP_LOGD(TAG, "AEC frame size: %u samples (%ums @ %uHz)",
-             (unsigned)out_frame_size, (unsigned)(out_frame_size * 1000 / out_rate), (unsigned)out_rate);
+             (unsigned)ctx.out_frame_size, (unsigned)(ctx.out_frame_size * 1000 / out_rate), (unsigned)out_rate);
   }
 #endif
 
-  // Bus frame size: how many samples per I2S read/write at bus rate
-  size_t bus_frame_size = out_frame_size * ratio;
-  size_t out_frame_bytes = out_frame_size * sizeof(int16_t);
-  size_t bus_frame_bytes = bus_frame_size * sizeof(int16_t);
+  // ── Frame sizing ──
+  ctx.bus_frame_size = ctx.out_frame_size * ctx.ratio;
+  ctx.out_frame_bytes = ctx.out_frame_size * sizeof(int16_t);
+  ctx.bus_frame_bytes = ctx.bus_frame_size * sizeof(int16_t);
+  ctx.aec_delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
 
-  // RX read size depends on mode:
-  // - TDM: bus_frame_size × tdm_total_slots samples (all slots interleaved)
-  // - Stereo: bus_frame_size × 2 (L+R interleaved)
-  // - Mono: bus_frame_size
-  // I2S bytes per sample: 2 for 16-bit, 4 for 24/32-bit (24-bit uses 32-bit DMA containers)
-  const uint8_t i2s_bps = (this->bits_per_sample_ > 16) ? 4 : 2;
-  const uint8_t num_ch = this->num_channels_;  // TX channels: 1 (mono) or 2 (stereo)
-
-  size_t rx_frame_bytes;
-  if (this->use_tdm_ref_) {
-    rx_frame_bytes = bus_frame_size * this->tdm_total_slots_ * i2s_bps;
-  } else if (this->use_stereo_aec_ref_) {
-    rx_frame_bytes = bus_frame_size * 2 * i2s_bps;
+  if (ctx.use_tdm_ref) {
+    ctx.rx_frame_bytes = ctx.bus_frame_size * ctx.tdm_total_slots * ctx.i2s_bps;
+  } else if (ctx.use_stereo_aec_ref) {
+    ctx.rx_frame_bytes = ctx.bus_frame_size * 2 * ctx.i2s_bps;
   } else {
-    rx_frame_bytes = bus_frame_size * i2s_bps;
+    ctx.rx_frame_bytes = ctx.bus_frame_size * ctx.i2s_bps;
   }
 
   // ── Buffer allocations ──
-  // rx_buffer: DMA-capable, holds one I2S RX frame at bus rate
-  auto *rx_buffer = static_cast<int16_t *>(
-      heap_caps_malloc(rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  // AEC buffers use 16-byte alignment (ESP-SR may use SIMD internally)
+  static constexpr size_t AEC_ALIGN = 16;
 
-  // mic_buffer: holds output-rate mic data (decimated or direct)
-  bool mic_separate = (ratio > 1) || this->use_stereo_aec_ref_ || this->use_tdm_ref_;
-  int16_t *mic_buffer = mic_separate
-      ? static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL))
-      : rx_buffer;  // mono, no decimation: alias rx_buffer
+  ctx.rx_buffer = static_cast<int16_t *>(
+      heap_caps_malloc(ctx.rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
-  // spk_buffer: DMA-capable, TX output at bus rate (read from ring buffer, write to I2S)
-  // Allocated at full I2S frame size: bus_frame_size × num_channels × bytes_per_sample
-  auto *spk_buffer = static_cast<int16_t *>(
-      heap_caps_malloc(bus_frame_size * num_ch * i2s_bps, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  ctx.mic_separate = (ctx.ratio > 1) || ctx.use_stereo_aec_ref || ctx.use_tdm_ref;
+  ctx.mic_buffer = ctx.mic_separate
+      ? static_cast<int16_t *>(heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL))
+      : ctx.rx_buffer;
 
-  // spk_ref_buffer: output-rate AEC reference (from stereo/TDM split or mono ring buffer after decimation)
-  int16_t *spk_ref_buffer = nullptr;
-  if (this->use_stereo_aec_ref_ || this->use_tdm_ref_) {
-    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
+  ctx.spk_buffer = static_cast<int16_t *>(
+      heap_caps_malloc(ctx.bus_frame_size * ctx.num_ch * ctx.i2s_bps, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+
+  if (ctx.use_stereo_aec_ref || ctx.use_tdm_ref) {
+    ctx.spk_ref_buffer = static_cast<int16_t *>(
+        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
   }
 
-  // Intermediate 48kHz buffers for stereo deinterleave before decimation
-  int16_t *deint_ref = nullptr;
-  int16_t *deint_mic = nullptr;
-  if (this->use_stereo_aec_ref_ && ratio > 1) {
-    deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+  if (ctx.use_stereo_aec_ref && ctx.ratio > 1) {
+    ctx.deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    ctx.deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
   }
 
-  // TDM buffers: intermediate deinterleave at bus rate (only when TDM + decimation)
-  int16_t *tdm_deint_mic = nullptr;
-  int16_t *tdm_deint_ref = nullptr;
-  if (this->use_tdm_ref_ && ratio > 1) {
-    tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+  if (ctx.use_tdm_ref && ctx.ratio > 1) {
+    ctx.tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    ctx.tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
   }
 
-  // TDM TX buffer: expanded frame with all slots (speaker data in slot 0, zeros in 1-3)
-  int16_t *tdm_tx_buffer = nullptr;
-  size_t tdm_tx_frame_bytes = 0;
-  if (this->use_tdm_ref_) {
-    tdm_tx_frame_bytes = bus_frame_size * this->tdm_total_slots_ * i2s_bps;
-    tdm_tx_buffer = static_cast<int16_t *>(
-        heap_caps_malloc(tdm_tx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  if (ctx.use_tdm_ref) {
+    ctx.tdm_tx_frame_bytes = ctx.bus_frame_size * ctx.tdm_total_slots * ctx.i2s_bps;
+    ctx.tdm_tx_buffer = static_cast<int16_t *>(
+        heap_caps_malloc(ctx.tdm_tx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
   }
-
-  // Mono mode AEC ref: temp buffer for reading bus-rate ref from ring buffer before decimation
-  int16_t *ref_bus_buffer = nullptr;
-  int16_t *aec_output = nullptr;
 
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
-    if (!spk_ref_buffer && !this->use_tdm_ref_)
-      spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
-    aec_output = static_cast<int16_t *>(heap_caps_malloc(out_frame_bytes, MALLOC_CAP_INTERNAL));
-    // For mono mode: need temp buffer for bus-rate ref read from ring buffer
-    if (!this->use_stereo_aec_ref_ && !this->use_tdm_ref_) {
-      ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    if (!ctx.spk_ref_buffer && !ctx.use_tdm_ref)
+      ctx.spk_ref_buffer = static_cast<int16_t *>(
+          heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
+    ctx.aec_output = static_cast<int16_t *>(
+        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
+    if (!ctx.use_stereo_aec_ref && !ctx.use_tdm_ref) {
+      ctx.ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
     }
   }
 #endif
 
-  // Verify critical allocations — on failure, signal error robustly to upper layers
-  if (!rx_buffer || !spk_buffer || (mic_separate && !mic_buffer)) {
-    ESP_LOGE(TAG, "Failed to allocate audio buffers");
+  // ── Verify critical allocations ──
+  auto alloc_fail = [this](const char *what) {
+    ESP_LOGE(TAG, "Failed to allocate %s", what);
     this->has_i2s_error_.store(true, std::memory_order_relaxed);
     this->task_exited_.store(true, std::memory_order_relaxed);
-    goto cleanup;
+  };
+  if (!ctx.rx_buffer || !ctx.spk_buffer || (ctx.mic_separate && !ctx.mic_buffer)) {
+    alloc_fail("audio buffers"); goto cleanup;
   }
-  if (this->use_stereo_aec_ref_ && ratio > 1 && (!deint_ref || !deint_mic)) {
-    ESP_LOGE(TAG, "Failed to allocate stereo decimation buffers");
-    this->has_i2s_error_.store(true, std::memory_order_relaxed);
-    this->task_exited_.store(true, std::memory_order_relaxed);
-    goto cleanup;
+  if (ctx.use_stereo_aec_ref && ctx.ratio > 1 && (!ctx.deint_ref || !ctx.deint_mic)) {
+    alloc_fail("stereo decimation buffers"); goto cleanup;
   }
-  if (this->use_tdm_ref_ && !tdm_tx_buffer) {
-    ESP_LOGE(TAG, "Failed to allocate TDM TX buffer");
-    this->has_i2s_error_.store(true, std::memory_order_relaxed);
-    this->task_exited_.store(true, std::memory_order_relaxed);
-    goto cleanup;
+  if (ctx.use_tdm_ref && !ctx.tdm_tx_buffer) {
+    alloc_fail("TDM TX buffer"); goto cleanup;
   }
-  if (this->use_tdm_ref_ && ratio > 1 && (!tdm_deint_mic || !tdm_deint_ref)) {
-    ESP_LOGE(TAG, "Failed to allocate TDM decimation buffers");
-    this->has_i2s_error_.store(true, std::memory_order_relaxed);
-    this->task_exited_.store(true, std::memory_order_relaxed);
-    goto cleanup;
+  if (ctx.use_tdm_ref && ctx.ratio > 1 && (!ctx.tdm_deint_mic || !ctx.tdm_deint_ref)) {
+    alloc_fail("TDM decimation buffers"); goto cleanup;
   }
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
-    if (!aec_output) {
-      ESP_LOGE(TAG, "Failed to allocate AEC output buffer");
-      this->has_i2s_error_.store(true, std::memory_order_relaxed);
-      this->task_exited_.store(true, std::memory_order_relaxed);
-      goto cleanup;
+    if (!ctx.aec_output) { alloc_fail("AEC output buffer"); goto cleanup; }
+    if ((ctx.use_stereo_aec_ref || ctx.use_tdm_ref) && !ctx.spk_ref_buffer) {
+      alloc_fail("AEC reference buffer"); goto cleanup;
     }
-    if ((this->use_stereo_aec_ref_ || this->use_tdm_ref_) && !spk_ref_buffer) {
-      ESP_LOGE(TAG, "Failed to allocate AEC reference buffer");
-      this->has_i2s_error_.store(true, std::memory_order_relaxed);
-      this->task_exited_.store(true, std::memory_order_relaxed);
-      goto cleanup;
-    }
-    if (!this->use_stereo_aec_ref_ && !this->use_tdm_ref_ && !ref_bus_buffer) {
-      ESP_LOGE(TAG, "Failed to allocate AEC mono reference buffer");
-      this->has_i2s_error_.store(true, std::memory_order_relaxed);
-      this->task_exited_.store(true, std::memory_order_relaxed);
-      goto cleanup;
+    if (!ctx.use_stereo_aec_ref && !ctx.use_tdm_ref && !ctx.ref_bus_buffer) {
+      alloc_fail("AEC mono reference buffer"); goto cleanup;
     }
   }
 #endif
 
-  {
-    size_t bytes_read, bytes_written;
-    int consecutive_i2s_errors = 0;
-    int32_t dc_prev_input = 0;   // DC-block filter state (musicdsp.org high-pass, R = 1 - 2^-10)
-    int32_t dc_prev_output = 0;
-    // Pre-compute AEC delay bytes outside loop (L12: avoid per-frame recalculation)
-    const size_t aec_delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+  // ── Main loop ──
+  while (this->duplex_running_.load(std::memory_order_relaxed)) {
 
-    while (this->duplex_running_.load(std::memory_order_relaxed)) {
+    // Service ring buffer operations requested by main thread
+    if (this->request_speaker_reset_.exchange(false, std::memory_order_relaxed)) {
+      this->speaker_buffer_->reset();
+      if (this->speaker_ref_buffer_)
+        this->speaker_ref_buffer_->reset();
+    }
+    if (this->request_ref_prefill_.exchange(false, std::memory_order_relaxed)) {
+      this->speaker_buffer_->reset();
+      this->prefill_aec_ref_buffer_();
+    }
 
-      // Handle ring buffer operations requested by main thread (avoids concurrent access)
-      if (this->request_speaker_reset_.exchange(false, std::memory_order_relaxed)) {
-        this->speaker_buffer_->reset();
-        if (this->speaker_ref_buffer_)
-          this->speaker_ref_buffer_->reset();
-      }
-      if (this->request_ref_prefill_.exchange(false, std::memory_order_relaxed)) {
-        this->speaker_buffer_->reset();
-        this->prefill_aec_ref_buffer_();
-      }
+    // Reset per-frame state
+    ctx.output_buffer = nullptr;
 
-      // ══════════════════════════════════════════════════════════════════
-      // MICROPHONE READ (RX)
-      // Bus rate: reads bus_frame_size samples (mono) or bus_frame_size*2 (stereo)
-      // Output: out_frame_size samples at output rate after decimation
-      // ══════════════════════════════════════════════════════════════════
-      if (this->rx_handle_) {
-        esp_err_t err = i2s_channel_read(this->rx_handle_, rx_buffer, rx_frame_bytes,
-                                          &bytes_read, I2S_IO_TIMEOUT_MS);
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
-          ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
-          if (++consecutive_i2s_errors > 100) {
-            ESP_LOGE(TAG, "Persistent I2S errors (%d), stopping audio task", consecutive_i2s_errors);
-            this->has_i2s_error_.store(true, std::memory_order_relaxed);
-            break;
-          }
-        }
-        if (err == ESP_OK && bytes_read == rx_frame_bytes) {
-          consecutive_i2s_errors = 0;
+    // Snapshot atomic state for this frame (avoids repeated .load() in sample loops)
+    ctx.mic_attenuation = this->mic_attenuation_.load(std::memory_order_relaxed);
+    ctx.mic_gain = this->mic_gain_.load(std::memory_order_relaxed);
+    ctx.speaker_volume = this->speaker_volume_.load(std::memory_order_relaxed);
+    ctx.speaker_running = this->speaker_running_.load(std::memory_order_relaxed);
+    ctx.speaker_paused = this->speaker_paused_.load(std::memory_order_relaxed);
+    ctx.mic_running = this->mic_ref_count_.load(std::memory_order_relaxed) > 0;
 
-          // Convert 32-bit I2S samples to 16-bit for internal processing
-          if (i2s_bps == 4) {
-            auto *src32 = reinterpret_cast<int32_t *>(rx_buffer);
-            size_t total_i2s_samples = bytes_read / sizeof(int32_t);
-            for (size_t i = 0; i < total_i2s_samples; i++) {
-              rx_buffer[i] = static_cast<int16_t>(src32[i] >> 16);
-            }
-          }
+    this->process_rx_path_(ctx);
 
-          int16_t *output_buffer = mic_buffer;  // Default: no AEC processing
+    // Snapshot AEC gate state right before AEC decision for timing precision
+    ctx.aec_enabled = this->aec_enabled_.load(std::memory_order_relaxed);
+    ctx.aec_ref_volume = this->aec_ref_volume_.load(std::memory_order_relaxed);
+    ctx.now_ms = millis();
 
-#if SOC_I2S_SUPPORTS_TDM
-          if (this->use_tdm_ref_) {
-            // ── TDM PATH: deinterleave mic + ref from TDM frame ──
-            // rx_buffer layout: [s0,s1,s2,s3, s0,s1,s2,s3, ...] (tdm_total_slots_ per sample)
-            const uint8_t total_slots = this->tdm_total_slots_;
-            const uint8_t mic_slot = this->tdm_mic_slot_;
-            const uint8_t ref_slot = this->tdm_ref_slot_;
-            if (ratio > 1) {
-              // Deinterleave at bus rate into temp buffers, then FIR decimate
-              for (size_t i = 0; i < bus_frame_size; i++) {
-                tdm_deint_mic[i] = rx_buffer[i * total_slots + mic_slot];
-                tdm_deint_ref[i] = rx_buffer[i * total_slots + ref_slot];
-              }
-              this->mic_decimator_.process(tdm_deint_mic, mic_buffer, bus_frame_size);
-              this->ref_decimator_.process(tdm_deint_ref, spk_ref_buffer, bus_frame_size);
-            } else {
-              // No decimation: deinterleave directly into output buffers
-              for (size_t i = 0; i < out_frame_size; i++) {
-                mic_buffer[i] = rx_buffer[i * total_slots + mic_slot];
-                spk_ref_buffer[i] = rx_buffer[i * total_slots + ref_slot];
-              }
-            }
-          } else
-#endif  // SOC_I2S_SUPPORTS_TDM
-          if (ratio > 1) {
-            // ── DECIMATION PATH: bus rate -> output rate ──
-            if (this->use_stereo_aec_ref_) {
-              // Stereo 48kHz: deinterleave L/R then decimate both channels
-              const int ref_idx = this->ref_channel_right_ ? 1 : 0;
-              const int mic_idx = this->ref_channel_right_ ? 0 : 1;
-              for (size_t i = 0; i < bus_frame_size; i++) {
-                deint_ref[i] = rx_buffer[i * 2 + ref_idx];
-                deint_mic[i] = rx_buffer[i * 2 + mic_idx];
-              }
-              this->ref_decimator_.process(deint_ref, spk_ref_buffer, bus_frame_size);
-              this->mic_decimator_.process(deint_mic, mic_buffer, bus_frame_size);
-            } else {
-              // Mono 48kHz: decimate mic directly from rx_buffer
-              this->mic_decimator_.process(rx_buffer, mic_buffer, bus_frame_size);
-            }
-          } else {
-            // ── LEGACY PATH (no decimation) ──
-            if (this->use_stereo_aec_ref_) {
-              const int ref_idx = this->ref_channel_right_ ? 1 : 0;
-              const int mic_idx = this->ref_channel_right_ ? 0 : 1;
-              for (size_t i = 0; i < out_frame_size; i++) {
-                spk_ref_buffer[i] = rx_buffer[i * 2 + ref_idx];
-                mic_buffer[i] = rx_buffer[i * 2 + mic_idx];
-              }
-            }
-            // Mono: mic_buffer == rx_buffer (aliased), nothing to do
-          }
+    this->process_aec_and_callbacks_(ctx);
+    this->process_tx_path_(ctx);
 
-          // ── From here, all processing uses output-rate data ──
-
-          // DC offset correction: high-pass filter (musicdsp.org DC-block, matches ESPHome upstream)
-          // y[n] = x[n] - x[n-1] + R * y[n-1], R = 1 - 2^-10 (~2.5Hz cutoff at 16kHz)
-          // Operates in Q31 (int32 full range) so >>10 feedback has sufficient precision.
-          // In 16-bit range, >>10 truncates to ~0 for typical audio levels → filter becomes
-          // an unstable integrator. Q31 shift avoids this (matches upstream unpack_audio_sample_to_q31).
-          if (this->correct_dc_offset_) {
-            for (size_t i = 0; i < out_frame_size; i++) {
-              int32_t input = (int32_t) mic_buffer[i] << 16;  // 16-bit to Q31
-              int32_t output = input - dc_prev_input + dc_prev_output - (dc_prev_output >> 10);
-              dc_prev_input = input;
-              dc_prev_output = output;
-              mic_buffer[i] = static_cast<int16_t>(output >> 16);  // Q31 back to 16-bit
-            }
-          }
-
-          // Apply pre-AEC mic attenuation for hot mics (ES8311)
-          if (this->mic_attenuation_ != 1.0f) {
-            for (size_t i = 0; i < out_frame_size; i++) {
-              mic_buffer[i] = scale_sample(mic_buffer[i], this->mic_attenuation_);
-            }
-          }
-
-          // Raw mic callbacks: pre-AEC audio for MWW
-          if (this->is_mic_running() && !this->raw_mic_callbacks_.empty()) {
-            for (auto &callback : this->raw_mic_callbacks_) {
-              callback((const uint8_t *) mic_buffer, out_frame_bytes);
-            }
-          }
-
-#ifdef USE_ESP_AEC
-#if SOC_I2S_SUPPORTS_TDM
-          if (this->use_tdm_ref_ && this->aec_ != nullptr && this->aec_enabled_.load(std::memory_order_relaxed) &&
-              this->aec_->is_initialized() && spk_ref_buffer != nullptr && aec_output != nullptr) {
-            // ── TDM MODE: hardware-synced reference from TDM slot ──
-            // No speaker gating needed: ref comes from ES7210 MIC3 hardware feedback.
-            // When speaker is silent, ref is silent → AEC passes through.
-            // TDM analog ref already reflects DAC hardware volume — do NOT apply aec_ref_volume_
-            // (that would double-attenuate). Only match mic_attenuation_ so levels align.
-            if (this->mic_attenuation_ != 1.0f) {
-              for (size_t i = 0; i < out_frame_size; i++) {
-                spk_ref_buffer[i] = scale_sample(spk_ref_buffer[i], this->mic_attenuation_);
-              }
-            }
-            this->aec_->process(mic_buffer, spk_ref_buffer, aec_output, out_frame_size);
-            output_buffer = aec_output;
-          } else
-#endif  // SOC_I2S_SUPPORTS_TDM
-          if (!this->use_tdm_ref_ &&
-              this->aec_ != nullptr && this->aec_enabled_.load(std::memory_order_relaxed) && this->aec_->is_initialized() &&
-              spk_ref_buffer != nullptr && aec_output != nullptr && this->speaker_running_.load(std::memory_order_relaxed) &&
-              (millis() - this->last_speaker_audio_ms_ <= AEC_ACTIVE_TIMEOUT_MS)) {
-
-            // ── MONO MODE: Get reference from ring buffer, decimate to output rate ──
-            if (!this->use_stereo_aec_ref_) {
-              size_t min_ref_bytes = aec_delay_bytes + bus_frame_bytes;
-              size_t ref_available = this->speaker_ref_buffer_ ? this->speaker_ref_buffer_->available() : 0;
-
-              if (this->speaker_ref_buffer_ != nullptr && ref_available >= min_ref_bytes && ref_bus_buffer != nullptr) {
-                this->speaker_ref_buffer_->read((void *) ref_bus_buffer, bus_frame_bytes, 0);
-                // Decimate bus-rate → output-rate for AEC
-                this->play_ref_decimator_.process(ref_bus_buffer, spk_ref_buffer, bus_frame_size);
-              } else {
-                memset(spk_ref_buffer, 0, out_frame_bytes);
-              }
-
-              // Scale ref for AEC alignment (match mic attenuation level)
-              float ref_scale = this->aec_ref_volume_ * this->mic_attenuation_;
-              if (ref_scale != 1.0f) {
-                for (size_t i = 0; i < out_frame_size; i++) {
-                  spk_ref_buffer[i] = scale_sample(spk_ref_buffer[i], ref_scale);
-                }
-              }
-            }
-            // STEREO MODE: spk_ref_buffer already filled from deinterleave (+decimate) above.
-            // ES8311 digital loopback is post-DSP-volume — do NOT apply aec_ref_volume_
-            // (that would double-attenuate). Only match mic_attenuation_ so levels align.
-            if (this->use_stereo_aec_ref_ && this->mic_attenuation_ != 1.0f) {
-              for (size_t i = 0; i < out_frame_size; i++) {
-                spk_ref_buffer[i] = scale_sample(spk_ref_buffer[i], this->mic_attenuation_);
-              }
-            }
-
-            this->aec_->process(mic_buffer, spk_ref_buffer, aec_output, out_frame_size);
-            output_buffer = aec_output;
-          }
-#endif
-
-          // Apply mic gain
-          if (this->mic_gain_ != 1.0f) {
-            for (size_t i = 0; i < out_frame_size; i++) {
-              output_buffer[i] = scale_sample(output_buffer[i], this->mic_gain_);
-            }
-          }
-
-          // Call callbacks only when mic is active
-          if (this->is_mic_running()) {
-            for (auto &callback : this->mic_callbacks_) {
-              callback((const uint8_t *) output_buffer, out_frame_bytes);
-            }
-          }
-        }
-      }
-
-      // ══════════════════════════════════════════════════════════════════
-      // SPEAKER WRITE (TX)
-      // Read bus-rate data from ring buffer, apply volume, write to I2S
-      // ══════════════════════════════════════════════════════════════════
-      if (this->tx_handle_) {
-        if (this->speaker_running_.load(std::memory_order_relaxed)) {
-          size_t got = this->speaker_buffer_->read((void *) spk_buffer, bus_frame_bytes, 0);
-
-          if (this->speaker_paused_.load(std::memory_order_relaxed)) {
-            // Paused: drain buffer but write silence to I2S (keeps mixer flowing)
-            memset(spk_buffer, 0, bus_frame_bytes);
-          } else if (got > 0) {
-            size_t got_samples = got / sizeof(int16_t);
-
-            // Apply speaker volume
-            if (this->speaker_volume_ != 1.0f) {
-              for (size_t i = 0; i < got_samples; i++) {
-                spk_buffer[i] = scale_sample(spk_buffer[i], this->speaker_volume_);
-              }
-            }
-
-            // Pad remainder with silence if partial read
-            if (got < bus_frame_bytes) {
-              memset(((uint8_t *) spk_buffer) + got, 0, bus_frame_bytes - got);
-            }
-          } else {
-            memset(spk_buffer, 0, bus_frame_bytes);
-          }
-        } else {
-          memset(spk_buffer, 0, bus_frame_bytes);
-        }
-
-        // Prepare TX data: expand to I2S bit depth and handle TDM interleave
-        const void *tx_data;
-        size_t tx_bytes;
-#if SOC_I2S_SUPPORTS_TDM
-        if (this->use_tdm_ref_ && tdm_tx_buffer != nullptr) {
-          // TDM: interleave mono into multi-slot frame at I2S bit depth
-          if (i2s_bps == 4) {
-            auto *tdm32 = reinterpret_cast<int32_t *>(tdm_tx_buffer);
-            memset(tdm32, 0, tdm_tx_frame_bytes);
-            for (size_t i = 0; i < bus_frame_size; i++) {
-              tdm32[i * this->tdm_total_slots_] = static_cast<int32_t>(spk_buffer[i]) << 16;
-            }
-          } else {
-            memset(tdm_tx_buffer, 0, tdm_tx_frame_bytes);
-            for (size_t i = 0; i < bus_frame_size; i++) {
-              tdm_tx_buffer[i * this->tdm_total_slots_] = spk_buffer[i];
-            }
-          }
-          tx_data = tdm_tx_buffer;
-          tx_bytes = tdm_tx_frame_bytes;
-        } else
-#endif  // SOC_I2S_SUPPORTS_TDM
-        {
-          // Standard: mono→stereo expansion (if needed), then 16→32 expansion (if needed)
-          // Both are backward in-place expansions: stereo doubles sample count, 32-bit doubles sample size
-          if (num_ch == 2) {
-            for (int i = static_cast<int>(bus_frame_size) - 1; i >= 0; i--) {
-              spk_buffer[i * 2 + 1] = spk_buffer[i];  // R = duplicate
-              spk_buffer[i * 2] = spk_buffer[i];       // L = original
-            }
-          }
-          size_t total_tx_samples = bus_frame_size * num_ch;
-          if (i2s_bps == 4) {
-            auto *dst32 = reinterpret_cast<int32_t *>(spk_buffer);
-            for (int i = static_cast<int>(total_tx_samples) - 1; i >= 0; i--) {
-              dst32[i] = static_cast<int32_t>(spk_buffer[i]) << 16;
-            }
-          }
-          tx_data = spk_buffer;
-          tx_bytes = total_tx_samples * i2s_bps;
-        }
-
-        esp_err_t err = i2s_channel_write(this->tx_handle_, tx_data, tx_bytes, &bytes_written, I2S_IO_TIMEOUT_MS);
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
-          ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(err));
-          if (++consecutive_i2s_errors > 100) {
-            ESP_LOGE(TAG, "Persistent I2S errors (%d), stopping audio task", consecutive_i2s_errors);
-            this->has_i2s_error_.store(true, std::memory_order_relaxed);
-            break;
-          }
-        } else if (err == ESP_OK) {
-          consecutive_i2s_errors = 0;
-        }
-
-        // Report frames played at bus rate (mixer operates at bus rate).
-        // For TDM, bytes_written includes all slots — convert back to mono frame count.
-        if (err == ESP_OK && bytes_written > 0 && !this->speaker_output_callbacks_.empty()) {
-          uint32_t frames_played = this->use_tdm_ref_
-              ? bytes_written / (this->tdm_total_slots_ * i2s_bps)
-              : bytes_written / (num_ch * i2s_bps);
-          int64_t timestamp = esp_timer_get_time();
-          for (auto &cb : this->speaker_output_callbacks_) {
-            cb(frames_played, timestamp);
-          }
-        }
-      }
-
-      // Yield: I2S read/write already block on DMA, so taskYIELD suffices.
-      // Back off with delay(1) only when I2S is returning errors.
-      if (consecutive_i2s_errors > 0) {
-        delay(1);
-      } else {
-        taskYIELD();
-      }
+    // Yield: I2S read/write already block on DMA, so taskYIELD suffices.
+    if (ctx.consecutive_i2s_errors > 0) {
+      delay(1);
+    } else {
+      taskYIELD();
     }
   }
 
   this->task_exited_.store(true, std::memory_order_relaxed);
 
 cleanup:
-  heap_caps_free(rx_buffer);
-  if (mic_separate && mic_buffer) heap_caps_free(mic_buffer);
-  heap_caps_free(spk_buffer);
-  if (spk_ref_buffer) heap_caps_free(spk_ref_buffer);
-  if (deint_ref) heap_caps_free(deint_ref);
-  if (deint_mic) heap_caps_free(deint_mic);
-  if (tdm_deint_mic) heap_caps_free(tdm_deint_mic);
-  if (tdm_deint_ref) heap_caps_free(tdm_deint_ref);
-  if (tdm_tx_buffer) heap_caps_free(tdm_tx_buffer);
-  if (ref_bus_buffer) heap_caps_free(ref_bus_buffer);
-  if (aec_output) heap_caps_free(aec_output);
+  heap_caps_free(ctx.rx_buffer);
+  if (ctx.mic_separate && ctx.mic_buffer) heap_caps_free(ctx.mic_buffer);
+  heap_caps_free(ctx.spk_buffer);
+  if (ctx.spk_ref_buffer) heap_caps_free(ctx.spk_ref_buffer);
+  if (ctx.deint_ref) heap_caps_free(ctx.deint_ref);
+  if (ctx.deint_mic) heap_caps_free(ctx.deint_mic);
+  if (ctx.tdm_deint_mic) heap_caps_free(ctx.tdm_deint_mic);
+  if (ctx.tdm_deint_ref) heap_caps_free(ctx.tdm_deint_ref);
+  if (ctx.tdm_tx_buffer) heap_caps_free(ctx.tdm_tx_buffer);
+  if (ctx.ref_bus_buffer) heap_caps_free(ctx.ref_bus_buffer);
+  if (ctx.aec_output) heap_caps_free(ctx.aec_output);
   ESP_LOGI(TAG, "Audio task stopped");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// RX PATH: I2S read → deinterleave/decimate → mic_buffer + spk_ref_buffer
+// ════════════════════════════════════════════════════════════════════════════
+void I2SAudioDuplex::process_rx_path_(AudioTaskCtx &ctx) {
+  if (!this->rx_handle_)
+    return;
+
+  size_t bytes_read;
+  esp_err_t err = i2s_channel_read(this->rx_handle_, ctx.rx_buffer, ctx.rx_frame_bytes,
+                                    &bytes_read, I2S_IO_TIMEOUT_MS);
+  if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
+    if (++ctx.consecutive_i2s_errors > 100) {
+      ESP_LOGE(TAG, "Persistent I2S read errors (%d)", ctx.consecutive_i2s_errors);
+      this->has_i2s_error_.store(true, std::memory_order_relaxed);
+      this->duplex_running_.store(false, std::memory_order_relaxed);
+    }
+    return;
+  }
+  if (err != ESP_OK || bytes_read != ctx.rx_frame_bytes)
+    return;
+
+  ctx.consecutive_i2s_errors = 0;
+
+  // Convert 32-bit I2S samples to 16-bit for internal processing
+  if (ctx.i2s_bps == 4) {
+    auto *src32 = reinterpret_cast<int32_t *>(ctx.rx_buffer);
+    size_t total_i2s_samples = bytes_read / sizeof(int32_t);
+    for (size_t i = 0; i < total_i2s_samples; i++) {
+      ctx.rx_buffer[i] = static_cast<int16_t>(src32[i] >> 16);
+    }
+  }
+
+  ctx.output_buffer = ctx.mic_buffer;  // Default: no AEC processing
+
+#if SOC_I2S_SUPPORTS_TDM
+  if (ctx.use_tdm_ref) {
+    const uint8_t ts = ctx.tdm_total_slots;
+    const uint8_t ms = ctx.tdm_mic_slot;
+    const uint8_t rs = ctx.tdm_ref_slot;
+    if (ctx.ratio > 1) {
+      for (size_t i = 0; i < ctx.bus_frame_size; i++) {
+        ctx.tdm_deint_mic[i] = ctx.rx_buffer[i * ts + ms];
+        ctx.tdm_deint_ref[i] = ctx.rx_buffer[i * ts + rs];
+      }
+      this->mic_decimator_.process(ctx.tdm_deint_mic, ctx.mic_buffer, ctx.bus_frame_size);
+      this->ref_decimator_.process(ctx.tdm_deint_ref, ctx.spk_ref_buffer, ctx.bus_frame_size);
+    } else {
+      for (size_t i = 0; i < ctx.out_frame_size; i++) {
+        ctx.mic_buffer[i] = ctx.rx_buffer[i * ts + ms];
+        ctx.spk_ref_buffer[i] = ctx.rx_buffer[i * ts + rs];
+      }
+    }
+  } else
+#endif
+  if (ctx.ratio > 1) {
+    if (ctx.use_stereo_aec_ref) {
+      const int ri = ctx.ref_channel_right ? 1 : 0;
+      const int mi = ctx.ref_channel_right ? 0 : 1;
+      for (size_t i = 0; i < ctx.bus_frame_size; i++) {
+        ctx.deint_ref[i] = ctx.rx_buffer[i * 2 + ri];
+        ctx.deint_mic[i] = ctx.rx_buffer[i * 2 + mi];
+      }
+      this->ref_decimator_.process(ctx.deint_ref, ctx.spk_ref_buffer, ctx.bus_frame_size);
+      this->mic_decimator_.process(ctx.deint_mic, ctx.mic_buffer, ctx.bus_frame_size);
+    } else {
+      this->mic_decimator_.process(ctx.rx_buffer, ctx.mic_buffer, ctx.bus_frame_size);
+    }
+  } else {
+    if (ctx.use_stereo_aec_ref) {
+      const int ri = ctx.ref_channel_right ? 1 : 0;
+      const int mi = ctx.ref_channel_right ? 0 : 1;
+      for (size_t i = 0; i < ctx.out_frame_size; i++) {
+        ctx.spk_ref_buffer[i] = ctx.rx_buffer[i * 2 + ri];
+        ctx.mic_buffer[i] = ctx.rx_buffer[i * 2 + mi];
+      }
+    }
+    // Mono without decimation: mic_buffer == rx_buffer (aliased), nothing to do
+  }
+
+  // DC offset correction (musicdsp.org DC-block in Q31, matches upstream)
+  if (ctx.correct_dc_offset) {
+    for (size_t i = 0; i < ctx.out_frame_size; i++) {
+      int32_t input = (int32_t) ctx.mic_buffer[i] << 16;
+      int32_t output = input - ctx.dc_prev_input + ctx.dc_prev_output - (ctx.dc_prev_output >> 10);
+      ctx.dc_prev_input = input;
+      ctx.dc_prev_output = output;
+      ctx.mic_buffer[i] = static_cast<int16_t>(output >> 16);
+    }
+  }
+
+  // Pre-AEC mic attenuation (snapshot value, no atomic load in loop)
+  if (ctx.mic_attenuation != 1.0f) {
+    for (size_t i = 0; i < ctx.out_frame_size; i++) {
+      ctx.mic_buffer[i] = scale_sample(ctx.mic_buffer[i], ctx.mic_attenuation);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AEC + CALLBACKS: raw callbacks → AEC processing → gain → post callbacks
+// ════════════════════════════════════════════════════════════════════════════
+void I2SAudioDuplex::process_aec_and_callbacks_(AudioTaskCtx &ctx) {
+  if (!this->rx_handle_ || ctx.output_buffer == nullptr)
+    return;
+
+  // Raw mic callbacks: pre-AEC audio for MWW
+  if (ctx.mic_running && !this->raw_mic_callbacks_.empty()) {
+    for (auto &callback : this->raw_mic_callbacks_) {
+      callback((const uint8_t *) ctx.mic_buffer, ctx.out_frame_bytes);
+    }
+  }
+
+#ifdef USE_ESP_AEC
+#if SOC_I2S_SUPPORTS_TDM
+  if (ctx.use_tdm_ref && this->aec_ != nullptr && ctx.aec_enabled &&
+      this->aec_->is_initialized() && ctx.spk_ref_buffer != nullptr && ctx.aec_output != nullptr) {
+    // TDM: hardware-synced reference, no speaker gating needed.
+    // TDM analog ref already reflects DAC volume — only match mic_attenuation.
+    if (ctx.mic_attenuation != 1.0f) {
+      for (size_t i = 0; i < ctx.out_frame_size; i++) {
+        ctx.spk_ref_buffer[i] = scale_sample(ctx.spk_ref_buffer[i], ctx.mic_attenuation);
+      }
+    }
+    this->aec_->process(ctx.mic_buffer, ctx.spk_ref_buffer, ctx.aec_output, ctx.out_frame_size);
+    ctx.output_buffer = ctx.aec_output;
+  } else
+#endif
+  if (!ctx.use_tdm_ref && this->aec_ != nullptr && ctx.aec_enabled && this->aec_->is_initialized() &&
+      ctx.spk_ref_buffer != nullptr && ctx.aec_output != nullptr && ctx.speaker_running &&
+      (ctx.now_ms - this->last_speaker_audio_ms_.load(std::memory_order_relaxed) <= AEC_ACTIVE_TIMEOUT_MS)) {
+
+    // Mono mode: read reference from ring buffer, decimate to output rate
+    if (!ctx.use_stereo_aec_ref) {
+      size_t min_ref_bytes = ctx.aec_delay_bytes + ctx.bus_frame_bytes;
+      size_t ref_available = this->speaker_ref_buffer_ ? this->speaker_ref_buffer_->available() : 0;
+
+      if (this->speaker_ref_buffer_ != nullptr && ref_available >= min_ref_bytes && ctx.ref_bus_buffer != nullptr) {
+        this->speaker_ref_buffer_->read((void *) ctx.ref_bus_buffer, ctx.bus_frame_bytes, 0);
+        this->play_ref_decimator_.process(ctx.ref_bus_buffer, ctx.spk_ref_buffer, ctx.bus_frame_size);
+      } else {
+        memset(ctx.spk_ref_buffer, 0, ctx.out_frame_bytes);
+      }
+
+      float ref_scale = ctx.aec_ref_volume * ctx.mic_attenuation;
+      if (ref_scale != 1.0f) {
+        for (size_t i = 0; i < ctx.out_frame_size; i++) {
+          ctx.spk_ref_buffer[i] = scale_sample(ctx.spk_ref_buffer[i], ref_scale);
+        }
+      }
+    }
+    // Stereo mode: spk_ref_buffer already filled from deinterleave. Match mic_attenuation only.
+    if (ctx.use_stereo_aec_ref && ctx.mic_attenuation != 1.0f) {
+      for (size_t i = 0; i < ctx.out_frame_size; i++) {
+        ctx.spk_ref_buffer[i] = scale_sample(ctx.spk_ref_buffer[i], ctx.mic_attenuation);
+      }
+    }
+
+    this->aec_->process(ctx.mic_buffer, ctx.spk_ref_buffer, ctx.aec_output, ctx.out_frame_size);
+    ctx.output_buffer = ctx.aec_output;
+  }
+#endif
+
+  // Apply mic gain (snapshot value)
+  if (ctx.mic_gain != 1.0f) {
+    for (size_t i = 0; i < ctx.out_frame_size; i++) {
+      ctx.output_buffer[i] = scale_sample(ctx.output_buffer[i], ctx.mic_gain);
+    }
+  }
+
+  // Post-AEC callbacks (VA/STT)
+  if (ctx.mic_running) {
+    for (auto &callback : this->mic_callbacks_) {
+      callback((const uint8_t *) ctx.output_buffer, ctx.out_frame_bytes);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TX PATH: ring buffer read → volume → format expand → I2S write
+// ════════════════════════════════════════════════════════════════════════════
+void I2SAudioDuplex::process_tx_path_(AudioTaskCtx &ctx) {
+  if (!this->tx_handle_)
+    return;
+
+  if (ctx.speaker_running) {
+    size_t got = this->speaker_buffer_->read((void *) ctx.spk_buffer, ctx.bus_frame_bytes, 0);
+
+    if (ctx.speaker_paused) {
+      memset(ctx.spk_buffer, 0, ctx.bus_frame_bytes);
+    } else if (got > 0) {
+      if (ctx.speaker_volume != 1.0f) {
+        size_t got_samples = got / sizeof(int16_t);
+        for (size_t i = 0; i < got_samples; i++) {
+          ctx.spk_buffer[i] = scale_sample(ctx.spk_buffer[i], ctx.speaker_volume);
+        }
+      }
+      if (got < ctx.bus_frame_bytes) {
+        memset(((uint8_t *) ctx.spk_buffer) + got, 0, ctx.bus_frame_bytes - got);
+      }
+    } else {
+      memset(ctx.spk_buffer, 0, ctx.bus_frame_bytes);
+    }
+  } else {
+    memset(ctx.spk_buffer, 0, ctx.bus_frame_bytes);
+  }
+
+  // Prepare TX: format expansion + TDM interleave
+  const void *tx_data;
+  size_t tx_bytes;
+#if SOC_I2S_SUPPORTS_TDM
+  if (ctx.use_tdm_ref && ctx.tdm_tx_buffer != nullptr) {
+    if (ctx.i2s_bps == 4) {
+      auto *tdm32 = reinterpret_cast<int32_t *>(ctx.tdm_tx_buffer);
+      memset(tdm32, 0, ctx.tdm_tx_frame_bytes);
+      for (size_t i = 0; i < ctx.bus_frame_size; i++) {
+        tdm32[i * ctx.tdm_total_slots] = static_cast<int32_t>(ctx.spk_buffer[i]) << 16;
+      }
+    } else {
+      memset(ctx.tdm_tx_buffer, 0, ctx.tdm_tx_frame_bytes);
+      for (size_t i = 0; i < ctx.bus_frame_size; i++) {
+        ctx.tdm_tx_buffer[i * ctx.tdm_total_slots] = ctx.spk_buffer[i];
+      }
+    }
+    tx_data = ctx.tdm_tx_buffer;
+    tx_bytes = ctx.tdm_tx_frame_bytes;
+  } else
+#endif
+  {
+    if (ctx.num_ch == 2) {
+      for (int i = static_cast<int>(ctx.bus_frame_size) - 1; i >= 0; i--) {
+        ctx.spk_buffer[i * 2 + 1] = ctx.spk_buffer[i];
+        ctx.spk_buffer[i * 2] = ctx.spk_buffer[i];
+      }
+    }
+    size_t total_tx_samples = ctx.bus_frame_size * ctx.num_ch;
+    if (ctx.i2s_bps == 4) {
+      auto *dst32 = reinterpret_cast<int32_t *>(ctx.spk_buffer);
+      for (int i = static_cast<int>(total_tx_samples) - 1; i >= 0; i--) {
+        dst32[i] = static_cast<int32_t>(ctx.spk_buffer[i]) << 16;
+      }
+    }
+    tx_data = ctx.spk_buffer;
+    tx_bytes = total_tx_samples * ctx.i2s_bps;
+  }
+
+  size_t bytes_written;
+  esp_err_t err = i2s_channel_write(this->tx_handle_, tx_data, tx_bytes, &bytes_written, I2S_IO_TIMEOUT_MS);
+  if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(err));
+    if (++ctx.consecutive_i2s_errors > 100) {
+      ESP_LOGE(TAG, "Persistent I2S write errors (%d)", ctx.consecutive_i2s_errors);
+      this->has_i2s_error_.store(true, std::memory_order_relaxed);
+      this->duplex_running_.store(false, std::memory_order_relaxed);
+    }
+  } else if (err == ESP_OK) {
+    ctx.consecutive_i2s_errors = 0;
+  }
+
+  // Report frames played (for mixer pending_playback tracking)
+  if (err == ESP_OK && bytes_written > 0 && !this->speaker_output_callbacks_.empty()) {
+    uint32_t frames_played = ctx.use_tdm_ref
+        ? bytes_written / (ctx.tdm_total_slots * ctx.i2s_bps)
+        : bytes_written / (ctx.num_ch * ctx.i2s_bps);
+    int64_t timestamp = esp_timer_get_time();
+    for (auto &cb : this->speaker_output_callbacks_) {
+      cb(frames_played, timestamp);
+    }
+  }
 }
 
 size_t I2SAudioDuplex::get_speaker_buffer_available() const {

@@ -55,6 +55,9 @@ CONF_TDM_TOTAL_SLOTS = "tdm_total_slots"
 CONF_TDM_MIC_SLOT = "tdm_mic_slot"
 CONF_TDM_REF_SLOT = "tdm_ref_slot"
 CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
+CONF_TASK_PRIORITY = "task_priority"
+CONF_TASK_CORE = "task_core"
+CONF_TASK_STACK_SIZE = "task_stack_size"
 
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
@@ -194,6 +197,10 @@ CONFIG_SCHEMA = cv.All(
         cv.Optional(CONF_TDM_TOTAL_SLOTS, default=4): cv.int_range(min=2, max=8),
         cv.Optional(CONF_TDM_MIC_SLOT, default=0): cv.int_range(min=0, max=7),
         cv.Optional(CONF_TDM_REF_SLOT, default=1): cv.int_range(min=0, max=7),
+        # Audio task tuning (advanced)
+        cv.Optional(CONF_TASK_PRIORITY, default=19): cv.int_range(min=1, max=24),
+        cv.Optional(CONF_TASK_CORE, default=0): cv.int_range(min=-1, max=1),
+        cv.Optional(CONF_TASK_STACK_SIZE, default=8192): cv.int_range(min=4096, max=32768),
     }).extend(cv.COMPONENT_SCHEMA),
     _validate_sample_rates,
     _validate_tdm_config,
@@ -219,6 +226,17 @@ def _final_validate(config):
     if use_tdm and variant not in TDM_VARIANTS:
         raise cv.Invalid(
             f"use_tdm_reference requires TDM support, but {variant} does not have SOC_I2S_SUPPORTS_TDM"
+        )
+
+    # Single-core SoCs cannot pin to Core 1
+    SINGLE_CORE_VARIANTS = {
+        VARIANT_ESP32C3, VARIANT_ESP32C5, VARIANT_ESP32C6, VARIANT_ESP32C61,
+        VARIANT_ESP32H2, VARIANT_ESP32S2,
+    }
+    task_core = config.get(CONF_TASK_CORE, 0)
+    if task_core > 0 and variant in SINGLE_CORE_VARIANTS:
+        raise cv.Invalid(
+            f"task_core={task_core} not available on {variant} (single-core SoC)"
         )
 
     return config
@@ -281,6 +299,11 @@ async def to_code(config):
         cg.add(var.set_tdm_total_slots(config[CONF_TDM_TOTAL_SLOTS]))
         cg.add(var.set_tdm_mic_slot(config[CONF_TDM_MIC_SLOT]))
         cg.add(var.set_tdm_ref_slot(config[CONF_TDM_REF_SLOT]))
+
+    # Audio task tuning
+    cg.add(var.set_task_priority(config[CONF_TASK_PRIORITY]))
+    cg.add(var.set_task_core(config[CONF_TASK_CORE]))
+    cg.add(var.set_task_stack_size(config[CONF_TASK_STACK_SIZE]))
 
     # Link AEC if configured
     if CONF_AEC_ID in config:
