@@ -915,7 +915,7 @@ script:
             lv_obj_set_y(obj, y_center - fh / 2);
           };
 
-          // --- IC idle page (8 children in YAML order) ---
+          // --- IC idle page (6 children in YAML order) ---
           lv_obj_t* p = id(ic_idle_page)->obj;
           set_center_y(lv_obj_get_child(p, 0), ym[3]);   // title
           set_center_y(lv_obj_get_child(p, 1), ym[4]);   // "Intercom:"
@@ -923,8 +923,11 @@ script:
           set_center_y(lv_obj_get_child(p, 3), ym[6]);   // "Destination:"
           set_center_y(lv_obj_get_child(p, 4), ym[7]);   // peer name
           set_center_y(lv_obj_get_child(p, 5), ym[8]);   // contacts
-          set_center_y(lv_obj_get_child(p, 6), ym[10]);  // wifi
-          set_center_y(lv_obj_get_child(p, 7), ym[11]);  // HA
+
+          // --- top layer (2 children in YAML order) ---
+          p = lv_layer_top();
+          set_center_y(lv_obj_get_child(p, 1), ym[11]);  // clock
+          set_center_y(lv_obj_get_child(p, 2), ym[10]);  // battery wifi HA
 
           // --- IC ringing in page (6 children) ---
           p = id(ic_ringing_in_page)->obj;
@@ -1041,12 +1044,8 @@ script:
             lv_disp_load_scr(target);
           }
 
-      # Update dynamic labels when on idle page
-      - if:
-          condition:
-            binary_sensor.is_on: is_idle_screen
-          then:
-            - script.execute: update_idle_labels
+      # Update dynamic labels 
+      - script.execute: update_idle_labels
       # Self-heal: ensure MWW is active when in VA idle (catches any missed restarts)
       - if:
           condition:
@@ -1223,29 +1222,23 @@ script:
             char buf[32];
             snprintf(buf, sizeof(buf), "Contacts: %d", count);
             return std::string(buf);
-      - lvgl.label.update:
-          id: ic_idle_wifi_label
-          text:
-            format: "WiFi: %.0f%%"
-            args: ['id(wifi_pct).state']
-      - lvgl.label.update:
-          id: ic_idle_ha_label
-          text: !lambda 'return id(node_status).state ? std::string("HA: OK") : std::string("HA: --");'
 
   # Update clock and battery labels on idle page
   - id: update_idle_labels
     then:
       - lvgl.label.update:
-          id: idle_clock_label
+          id: top_clock_label
           text:
             format: "%02d:%02d"
             args: ['id(my_time).now().hour', 'id(my_time).now().minute']
       - if:
           condition:
-            - lambda: return id(battery_percentage).has_state() && !std::isnan(id(battery_percentage).state);
+            and:
+              - lambda: return id(battery_percentage).has_state() && !std::isnan(id(battery_percentage).state);
+              - lambda: return id(wifi_pct).has_state() && !std::isnan(id(wifi_pct).state);
           then:
             - lvgl.label.update:
-                id: idle_battery_label
+                id: top_battery_label
                 text: !lambda |-
                   bool charging = id(usb_connected).state;
                   float bat = id(battery_percentage).state;
@@ -1266,10 +1259,11 @@ script:
                   else if (wifi < 55) ret += "\U000F08BC";
                   else if (wifi < 80) ret += "\U000F08BD";
                   else ret += "\U000F08BE";
+                  ret += id(node_status).state ? "\U000F07D0" : "\U000F15D0";
                   return ret;
           else:
             - lvgl.label.update:
-                id: idle_battery_label
+                id: top_battery_label
                 text: ""
 
   # Update replying page labels with current page of wrapped text
@@ -2193,6 +2187,8 @@ font:
           - "\U000F08BC" # wifi-strength-1 (<55%)
           - "\U000F08BD" # wifi-strength-2 (<80%)
           - "\U000F08BE" # wifi-strength-3 (>=80%)
+          - "\U000F15D0" # Home Alert
+          - "\U000F07D0" # Home Assistant
   # Intercom fonts
   - file:
       type: gfonts
@@ -2292,6 +2288,20 @@ lvgl:
                 text: ""
                 text_color: 0x000000
                 text_font: font_timer
+      - label:
+          id: top_clock_label
+          align: BOTTOM_MID
+          y: -2
+          text: ""
+          text_color: 0xFFFFFF
+          text_font: font_clock
+      - label:
+          id: top_battery_label
+          align: BOTTOM_MID
+          y: -22
+          text: ""
+          text_color: 0xFFFFFF
+          text_font: font_clock
   pages:
     # ========================================================================
     # INITIALIZATION PAGE
@@ -2735,22 +2745,6 @@ lvgl:
             width: 200
             text_align: CENTER
             long_mode: DOT
-        - label:
-            id: ic_idle_wifi_label
-            align: TOP_MID
-            y: 0
-            text: "WiFi: --%"
-            text_color: 0xFFFFFF
-            text_font: font_debug
-            text_align: CENTER
-        - label:
-            id: ic_idle_ha_label
-            align: TOP_MID
-            y: 0
-            text: "HA: --"
-            text_color: 0xFFFFFF
-            text_font: font_debug
-            text_align: CENTER
 
     # ========================================================================
     # INTERCOM: RINGING IN PAGE
