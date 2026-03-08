@@ -115,10 +115,13 @@ api:
         id(intercom).publish_entity_states();
         // Force media_player to re-publish volume to HA (prevents stale slider)
         id(speaker_media_player).publish_state();
-    # Start MWW on HA connection
+    # Start MWW on HA connection (only if not already running)
     - if:
         condition:
-          switch.is_off: mute
+          and:
+            - switch.is_off: mute
+            - not:
+                lambda: 'return id(mww).is_running();'
         then:
           - micro_wake_word.start:
 
@@ -476,48 +479,77 @@ intercom_api:
 # =============================================================================
 script:
   # Restore LED to correct base state based on priority:
-  # Muted > Intercom streaming > Off
+  # Both muted > Mic muted > Speaker muted > In call > Media playing > Off
   # Ringing/Calling LEDs are set by their own handlers, not here.
   - id: restore_led
     mode: restart
     then:
       - if:
           condition:
-            switch.is_on: mute
+            and:
+              - switch.is_on: mute
+              - switch.is_on: speaker_mute
           then:
+            # Both muted — red slow pulse (attention)
             - light.turn_on:
                 id: status_led
                 red: 100%
                 green: 0%
                 blue: 0%
-                brightness: 30%
-                effect: none
+                brightness: 40%
+                effect: "Slow Pulse"
           else:
             - if:
                 condition:
-                  intercom_api.is_in_call: intercom
+                  switch.is_on: mute
                 then:
+                  # Mic muted — red dim
                   - light.turn_on:
                       id: status_led
-                      red: 30%
-                      green: 69%
-                      blue: 31%
-                      brightness: 100%
+                      red: 100%
+                      green: 0%
+                      blue: 0%
+                      brightness: 30%
                       effect: none
                 else:
                   - if:
                       condition:
-                        media_player.is_announcing:
+                        switch.is_on: speaker_mute
                       then:
+                        # Speaker muted — orange dim
                         - light.turn_on:
                             id: status_led
-                            red: 0%
-                            green: 100%
+                            red: 100%
+                            green: 50%
                             blue: 0%
-                            brightness: 100%
-                            effect: "Spin"
+                            brightness: 30%
+                            effect: none
                       else:
-                        - light.turn_off: status_led
+                        - if:
+                            condition:
+                              intercom_api.is_in_call: intercom
+                            then:
+                              - light.turn_on:
+                                  id: status_led
+                                  red: 30%
+                                  green: 69%
+                                  blue: 31%
+                                  brightness: 100%
+                                  effect: none
+                            else:
+                              - if:
+                                  condition:
+                                    media_player.is_announcing:
+                                  then:
+                                    - light.turn_on:
+                                        id: status_led
+                                        red: 0%
+                                        green: 100%
+                                        blue: 0%
+                                        brightness: 100%
+                                        effect: "Spin"
+                                  else:
+                                    - light.turn_off: status_led
 
   - id: intercom_ringing_loop
     mode: restart
@@ -683,15 +715,21 @@ switch:
       mode:
         output: true
 
-  # Mute (stops MWW)
+  # Mic Mute — silences microphone + stops wake word detection
   - platform: template
-    name: Mute
+    name: Mic Mute
     id: mute
     icon: mdi:microphone-off
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: ALWAYS_OFF
     on_turn_on:
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
+      - microphone.mute: mic_aec
+      - microphone.mute: mic_raw
       - light.turn_on:
           id: status_led
           red: 100%
@@ -702,8 +740,57 @@ switch:
       - delay: 2s
       - script.execute: restore_led
     on_turn_off:
-      # Restart MWW on unmute (resilience)
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Mic mute OFF — microphone active, MWW started"
+      - microphone.unmute: mic_aec
+      - microphone.unmute: mic_raw
       - micro_wake_word.start:
+      - light.turn_on:
+          id: status_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 60%
+          effect: "Fast Pulse"
+      - delay: 2s
+      - script.execute: restore_led
+
+  # Speaker Mute — DAC mute (clean silence) + amp off (power saving)
+  - platform: template
+    name: Speaker Mute
+    id: speaker_mute
+    icon: mdi:volume-off
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      # DAC mute first (clean silence), then amp off (no click)
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Speaker mute ON — DAC muted, amplifier off"
+      - speaker.mute_on: hw_speaker
+      - delay: 50ms
+      - switch.turn_off: speaker_enable
+      - light.turn_on:
+          id: status_led
+          red: 100%
+          green: 50%
+          blue: 0%
+          brightness: 60%
+          effect: "Fast Pulse"
+      - delay: 2s
+      - script.execute: restore_led
+    on_turn_off:
+      # Amp on first (stabilize), then DAC unmute (no pop)
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Speaker mute OFF — amplifier on, DAC unmuted"
+      - switch.turn_on: speaker_enable
+      - delay: 50ms
+      - speaker.mute_off: hw_speaker
       - light.turn_on:
           id: status_led
           red: 0%
