@@ -1044,8 +1044,8 @@ script:
             lv_disp_load_scr(target);
           }
 
-      # Update dynamic labels 
-      - script.execute: update_idle_labels
+      # Update top labels 
+      - script.execute: update_top_labels
       # Self-heal: ensure MWW is active when in VA idle (catches any missed restarts)
       - if:
           condition:
@@ -1224,7 +1224,7 @@ script:
             return std::string(buf);
 
   # Update clock and battery labels on idle page
-  - id: update_idle_labels
+  - id: update_top_labels
     then:
       - lvgl.label.update:
           id: top_clock_label
@@ -2908,7 +2908,7 @@ lvgl:
 interval:
   - interval: 30s
     then:
-      - script.execute: update_idle_labels
+      - script.execute: update_top_labels
 
 
 # =============================================================================
