@@ -2290,15 +2290,13 @@ lvgl:
                 text_font: font_timer
       - label:
           id: top_clock_label
-          align: BOTTOM_MID
-          y: -2
+          align: TOP_MID
           text: ""
           text_color: 0xFFFFFF
           text_font: font_clock
       - label:
           id: top_battery_label
-          align: BOTTOM_MID
-          y: -22
+          align: TOP_MID
           text: ""
           text_color: 0xFFFFFF
           text_font: font_clock
