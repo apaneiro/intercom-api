@@ -662,12 +662,13 @@ sequenceDiagram
 
 ### Tested Configurations
 
-| Device | Microphone | Speaker | I2S Mode | Component | AEC Reference | VA/MWW |
-|--------|------------|---------|----------|-----------|---------------|--------|
-| ESP32-S3 Mini | SPH0645 | MAX98357A | Dual bus | `i2s_audio` | Ring buffer | Yes (mixer speaker) |
-| Xiaozhi Ball V3 | ES8311 | ES8311 | Single bus | `i2s_audio_duplex` | ES8311 digital feedback (stereo) | Yes (dual mic path) |
-| Waveshare ESP32-S3-AUDIO | ES7210 (4-ch) | ES8311 | Single bus TDM | `i2s_audio_duplex` | ES7210 TDM analog (MIC3) | Yes (dual mic path) |
-| Waveshare ESP32-P4-WiFi6-Touch-LCD-10.1 | ES7210 (4-ch) | ES8311 | Single bus TDM | `i2s_audio_duplex` | ES7210 TDM analog (MIC3) | Yes (dual mic path, LVGL touch display) |
+| Device | Microphone | Speaker | I2S Mode | Component | AEC Reference | VA/MWW | Tested by |
+|--------|------------|---------|----------|-----------|---------------|--------|-----------|
+| ESP32-S3 Mini | SPH0645 | MAX98357A | Dual bus | `i2s_audio` | Ring buffer | Yes (mixer speaker) | [@n-IA-hane](https://github.com/n-IA-hane) |
+| Xiaozhi Ball V3 | ES8311 | ES8311 | Single bus | `i2s_audio_duplex` | ES8311 digital feedback (stereo) | Yes (dual mic path) | [@n-IA-hane](https://github.com/n-IA-hane) |
+| Waveshare ESP32-S3-AUDIO | ES7210 (4-ch) | ES8311 | Single bus TDM | `i2s_audio_duplex` | ES7210 TDM analog (MIC3) | Yes (dual mic path) | [@n-IA-hane](https://github.com/n-IA-hane) |
+| Waveshare ESP32-P4-WiFi6-Touch-LCD-10.1 | ES7210 (4-ch) | ES8311 | Single bus TDM | `i2s_audio_duplex` | ES7210 TDM analog (MIC3) | Yes (dual mic path, LVGL touch display) | [@n-IA-hane](https://github.com/n-IA-hane) |
+| [Onju Voice](https://github.com/justLV/onju-voice) | MEMS (dual) | DAC + mute GPIO | Single bus | `i2s_audio_duplex` | Ring buffer | Yes (dual mic path) | [@rmeissn](https://github.com/rmeissn) |
 
 > **Want to help expand this list?** Send me a device to test or consider a [donation](https://github.com/sponsors/n-IA-hane), every bit helps!
 
