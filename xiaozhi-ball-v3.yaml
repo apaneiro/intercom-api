@@ -394,6 +394,7 @@ media_player:
             - globals.set:
                 id: voice_assistant_phase
                 value: '${voice_assist_replying_phase_id}'
+            - script.execute: update_replying_text
             - script.execute: draw_display
     on_idle:
       - if:

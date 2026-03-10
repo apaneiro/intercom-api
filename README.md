@@ -1017,34 +1017,62 @@ views:
         cards:
           - type: custom:intercom-card
             entity_id: <your_device_id>
-            name: Intercom Mini
+            name: Waveshare S3 Audio
             mode: full
           - type: entities
             entities:
-              - entity: number.intercom_mini_speaker_volume
+              - entity: number.<your_device>_speaker_volume
                 name: Volume
-              - entity: number.intercom_mini_mic_gain
+              - entity: number.<your_device>_mic_gain
                 name: Mic gain
-              - entity: switch.intercom_mini_echo_cancellation
-              - entity: switch.intercom_mini_auto_answer
-              - entity: sensor.intercom_mini_contacts
-              - entity: button.intercom_mini_refresh_contacts
+              - entity: switch.<your_device>_echo_cancellation
+              - entity: switch.<your_device>_auto_answer
+              - entity: button.<your_device>_restart
+              - entity: sensor.<your_device>_contacts
+              - entity: select.<your_device>_wake_word
+              - entity: switch.<your_device>_wake_word
+              - entity: switch.<your_device>_mic_mute
+              - entity: switch.<your_device>_speaker_mute
       - type: grid
         cards:
           - type: custom:intercom-card
             entity_id: <your_device_id>
-            name: Intercom Xiaozhi
+            name: Xiaozhi Ball V3
             mode: full
           - type: entities
             entities:
-              - entity: number.intercom_xiaozhi_speaker_volume
+              - entity: number.<your_device>_speaker_volume
                 name: Volume
-              - entity: number.intercom_xiaozhi_mic_gain
+              - entity: number.<your_device>_mic_gain
                 name: Mic gain
-              - entity: switch.intercom_xiaozhi_echo_cancellation
-              - entity: switch.intercom_xiaozhi_auto_answer
-              - entity: sensor.intercom_xiaozhi_contacts
-              - entity: button.intercom_xiaozhi_refresh_contacts
+              - entity: switch.<your_device>_echo_cancellation
+              - entity: switch.<your_device>_auto_answer
+              - entity: button.<your_device>_restart
+              - entity: sensor.<your_device>_contacts
+              - entity: select.<your_device>_wake_word
+              - entity: switch.<your_device>_wake_word
+              - entity: switch.<your_device>_mic_mute
+              - entity: switch.<your_device>_speaker_mute
+      - type: grid
+        cards:
+          - type: custom:intercom-card
+            entity_id: <your_device_id>
+            name: Waveshare P4 Touch
+            mode: full
+          - type: entities
+            entities:
+              - entity: number.<your_device>_speaker_volume
+                name: Volume
+              - entity: number.<your_device>_mic_gain
+                name: Mic gain
+              - entity: switch.<your_device>_echo_cancellation
+              - entity: switch.<your_device>_auto_answer
+              - entity: button.<your_device>_restart
+              - entity: sensor.<your_device>_contacts
+              - entity: select.<your_device>_wake_word
+              - entity: switch.<your_device>_wake_word
+              - entity: switch.<your_device>_mic_mute
+              - entity: switch.<your_device>_speaker_mute
 ```
 
 ---

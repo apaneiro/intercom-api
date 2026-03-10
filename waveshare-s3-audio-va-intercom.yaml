@@ -87,7 +87,8 @@ esphome:
           id(es7210_adc).write_byte(0x46, 0x10);  // MIC4: PGA_ON + 0dB (unused, keep tidy)
 
           ESP_LOGI("es7210_tdm", "TDM config applied: clk=0x%02X, sdp2=0x02, MIC3 gain=0dB", reg01);
-      # MWW started by api.on_client_connected (needs HA connection first)
+      - delay: 1s
+      - micro_wake_word.start:
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -115,15 +116,6 @@ api:
         id(intercom).publish_entity_states();
         // Force media_player to re-publish volume to HA (prevents stale slider)
         id(speaker_media_player).publish_state();
-    # Start MWW on HA connection (only if not already running)
-    - if:
-        condition:
-          and:
-            - switch.is_off: mute
-            - not:
-                lambda: 'return id(mww).is_running();'
-        then:
-          - micro_wake_word.start:
 
 ota:
   - platform: esphome
