@@ -421,10 +421,15 @@ switch:
 
   - platform: template
     id: mute
-    name: "Mute"
+    name: "Mic Mute"
     icon: "mdi:microphone-off"
     optimistic: true
+    restore_mode: ALWAYS_OFF
     on_turn_on:
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
       - voice_assistant.stop:
       - microphone.mute:
@@ -439,6 +444,10 @@ switch:
       - delay: 2s
       - script.execute: restore_led
     on_turn_off:
+      - logger.log:
+          level: INFO
+          tag: mute
+          format: "Mic mute OFF — microphone active, MWW started"
       - microphone.unmute:
           id: mic_component
       - micro_wake_word.start:
