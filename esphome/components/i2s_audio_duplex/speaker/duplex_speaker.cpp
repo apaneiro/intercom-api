@@ -108,8 +108,6 @@ bool I2SAudioDuplexSpeaker::has_buffered_data() const {
 }
 
 void I2SAudioDuplexSpeaker::set_volume(float volume) {
-  ESP_LOGW(TAG, "set_volume(%.3f) mute=%d parent_vol_before=%.3f", volume, (int) this->mute_state_,
-           this->parent_->get_speaker_volume());
   speaker::Speaker::set_volume(volume);
 
 #ifdef USE_AUDIO_DAC
@@ -118,19 +116,14 @@ void I2SAudioDuplexSpeaker::set_volume(float volume) {
       this->audio_dac_->set_mute_off();
     }
     this->audio_dac_->set_volume(volume);
-    ESP_LOGW(TAG, "  → audio_dac path, set DAC volume=%.3f", volume);
   } else
 #endif
   {
-    float db_factor = volume_to_db_factor(volume);
-    this->parent_->set_speaker_volume(db_factor);
-    ESP_LOGW(TAG, "  → software path, linear=%.3f db_factor=%.3f", volume, db_factor);
+    this->parent_->set_speaker_volume(volume_to_db_factor(volume));
   }
 }
 
 void I2SAudioDuplexSpeaker::set_mute_state(bool mute_state) {
-  ESP_LOGW(TAG, "set_mute_state(%d) volume=%.3f parent_vol_before=%.3f", (int) mute_state, this->volume_,
-           this->parent_->get_speaker_volume());
   speaker::Speaker::set_mute_state(mute_state);
 
 #ifdef USE_AUDIO_DAC
@@ -140,17 +133,13 @@ void I2SAudioDuplexSpeaker::set_mute_state(bool mute_state) {
     } else {
       this->audio_dac_->set_mute_off();
     }
-    ESP_LOGW(TAG, "  → audio_dac path, mute=%d", (int) mute_state);
   } else
 #endif
   {
     if (mute_state) {
       this->parent_->set_speaker_volume(0.0f);
-      ESP_LOGW(TAG, "  → software mute ON, parent speaker_volume=0.000");
     } else {
-      float db_factor = volume_to_db_factor(this->volume_);
-      this->parent_->set_speaker_volume(db_factor);
-      ESP_LOGW(TAG, "  → software mute OFF, linear=%.3f db_factor=%.3f", this->volume_, db_factor);
+      this->parent_->set_speaker_volume(volume_to_db_factor(this->volume_));
     }
   }
 }
