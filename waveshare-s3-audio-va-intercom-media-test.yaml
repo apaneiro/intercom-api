@@ -516,6 +516,12 @@ intercom_api:
               id: media_speaker_mix
               decibel_reduction: 0
               duration: 500ms
+    # Free PAUSED media pipeline resources (20KB internal read_task stack)
+    - if:
+        condition:
+          media_player.is_paused:
+        then:
+          - media_player.stop:
     - script.execute: restore_led
     - if:
         condition:
@@ -534,6 +540,12 @@ intercom_api:
               id: media_speaker_mix
               decibel_reduction: 0
               duration: 500ms
+    # Free PAUSED media pipeline resources (20KB internal read_task stack)
+    - if:
+        condition:
+          media_player.is_paused:
+        then:
+          - media_player.stop:
     - script.execute: restore_led
     - if:
         condition:
@@ -552,6 +564,12 @@ intercom_api:
               id: media_speaker_mix
               decibel_reduction: 0
               duration: 500ms
+    # Free PAUSED media pipeline resources (20KB internal read_task stack)
+    - if:
+        condition:
+          media_player.is_paused:
+        then:
+          - media_player.stop:
     - light.turn_on:
         id: status_led
         red: 100%
