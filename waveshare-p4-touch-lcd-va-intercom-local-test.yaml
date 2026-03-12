@@ -127,6 +127,9 @@ esp32:
     advanced:
       enable_idf_experimental_features: true
     sdkconfig_options:
+      CONFIG_CACHE_L2_CACHE_256KB: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
 
