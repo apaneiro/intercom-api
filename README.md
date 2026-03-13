@@ -65,18 +65,11 @@ graph TD
 
 ### Why This Project?
 
-This component was born from the limitations of [esphome-intercom](https://github.com/n-IA-hane/esphome-intercom), which uses direct ESP-to-ESP UDP communication. That approach works great for local networks but fails in these scenarios:
+I love Home Assistant and ESPHome. I believed in the project from the early days: well-structured, resilient, stable, and thoughtfully designed from the start. Over the years, for clients, friends, family, and myself, I've managed to automate all kinds of things, but I always struggled with one particular challenge: building a Home Assistant-centric intercom system.
 
-- **Remote access**: WebRTC/go2rtc fails through NAT without port forwarding
-- **Complex setup**: Requires go2rtc server, STUN/TURN configuration
-- **Browser limitations**: WebRTC permission and codec issues
+Years ago I had started writing a server that received audio from an ESP microphone, but I abandoned it due to lack of time. Now, with the help of advanced reasoning AI models, the development speed has been incredible. I started in late December 2025 with [esphome-intercom](https://github.com/n-IA-hane/esphome-intercom), which used ESP-to-ESP audio via UDP and go2rtc/WebRTC for the browser side. But several issues quickly emerged with that approach (NAT traversal, STUN/TURN configuration, WebRTC browser quirks), so I set off on a new adventure: creating an intercom standard for ESPHome.
 
-**Intercom API** solves these problems:
-
-- Uses ESPHome's native API for control (port 6053)
-- Opens a dedicated TCP socket for audio streaming (port 6054)
-- **Works remotely** - Audio streams through HA's WebSocket, so Nabu Casa/reverse proxy/VPN all work
-- No WebRTC, no go2rtc, no port forwarding required
+Along the way I discovered that ESPHome couldn't handle a codec and I2S components simultaneously on the same I2S bus, which led to the creation of `i2s_audio_duplex`. I keep having new ideas about use cases, and users have started showing interest in individual components and making feature requests. The situation got out of hand! So here we are:
 
 ---
 
@@ -89,13 +82,14 @@ This component was born from the limitations of [esphome-intercom](https://githu
 - **Echo Cancellation (AEC)** - Built-in acoustic echo cancellation using ESP-SR
   *(ES8311 digital feedback mode provides perfect sample-accurate echo cancellation)*
 - **Voice Assistant compatible** - Coexists with ESPHome Voice Assistant and Micro Wake Word
+- **Ready-to-flash YAML configs** - Optimized configurations for real, tested hardware that combine Voice Assistant, Micro Wake Word, and Intercom running simultaneously, creating the most complete hub possible for a full Voice Assistant experience
 - **Auto Answer** - Configurable automatic call acceptance
 - **Ringtone on incoming calls** - Devices play a looping ringtone sound while ringing
 - **Volume Control** - Adjustable speaker volume and microphone gain
 - **Contact Management** - Select call destination from discovered devices
 - **Status LED** - Visual feedback for call states
 - **Persistent Settings** - Volume, gain, AEC state saved to flash
-- **Remote Access** - Works through any HA remote access method
+- **Remote Access** - Works through any HA remote access method (Nabu Casa, reverse proxy, VPN). No WebRTC, no go2rtc, no port forwarding required
 
 ---
 
@@ -833,6 +827,30 @@ The Voice Assistant and Intercom coexist seamlessly on the same hardware: shared
 - **Intercom calls**: Call other devices or Home Assistant with one tap; incoming calls ring with audio + visual feedback
 - **Weather at a glance**: Current conditions, temperature, and 5-day forecast updated automatically (touch displays)
 - **Mood-aware responses**: The assistant shows different expressions (happy, neutral, angry) based on the tone of its reply. Requires instructing your LLM to prepend an ASCII emoticon (`:-)` `:-(` `:-|`) to each response based on its tone
+- **Custom AI avatars**: On devices with a display, you can create your own assistant avatar by providing a set of PNG images in a standard folder structure. Set the `ai_avatar` substitution in your YAML to pick which avatar to use:
+
+  ```yaml
+  substitutions:
+    ai_avatar: my_assistant    # uses images/assistant/my_assistant/
+  ```
+
+  Each avatar folder must contain the following files:
+
+  | File | Purpose |
+  |------|---------|
+  | `idle_00.png` ... `idle_19.png` | Idle animation frames (20 frames, looped) |
+  | `listening.png` | Displayed while the assistant is listening |
+  | `thinking.png` | Displayed while the assistant is processing |
+  | `loading.png` | Displayed during initialization |
+  | `error.png` | Displayed on assistant error |
+  | `timer_finished.png` | Displayed when a timer completes |
+  | `happy.png` | Mood background for positive responses |
+  | `neutral.png` | Mood background for neutral responses |
+  | `angry.png` | Mood background for negative responses |
+  | `error_no_wifi.png` | WiFi disconnected overlay |
+  | `error_no_ha.png` | Home Assistant disconnected overlay |
+
+  The folder name matches the avatar identity (e.g. `images/assistant/troiaio/`). To switch avatar, just change the substitution. Images are resized automatically at compile time (240x240 for Xiaozhi Ball, 400x400 for P4 Touch LCD).
 
 ### AEC Best Practices
 
