@@ -386,7 +386,7 @@ void IntercomApi::decline_call() {
     this->close_client_socket_();
     this->set_active_(false);  // Stop mic/speaker (start() enabled them)
     this->state_ = ConnectionState::DISCONNECTED;
-    this->end_call_(CallEndReason::TIMEOUT);
+    this->end_call_(CallEndReason::DECLINED);
     return;
   }
   
