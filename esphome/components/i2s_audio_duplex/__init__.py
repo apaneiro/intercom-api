@@ -58,6 +58,7 @@ CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
 CONF_TASK_PRIORITY = "task_priority"
 CONF_TASK_CORE = "task_core"
 CONF_TASK_STACK_SIZE = "task_stack_size"
+CONF_BUFFERS_IN_PSRAM = "buffers_in_psram"
 
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
@@ -201,6 +202,9 @@ CONFIG_SCHEMA = cv.All(
         cv.Optional(CONF_TASK_PRIORITY, default=19): cv.int_range(min=1, max=24),
         cv.Optional(CONF_TASK_CORE, default=0): cv.int_range(min=-1, max=1),
         cv.Optional(CONF_TASK_STACK_SIZE, default=8192): cv.int_range(min=4096, max=32768),
+        # Use PSRAM for non-DMA audio buffers (saves ~15KB internal RAM).
+        # Requires PSRAM. DMA buffers (I2S RX/TX) always use internal RAM.
+        cv.Optional(CONF_BUFFERS_IN_PSRAM, default=False): cv.boolean,
     }).extend(cv.COMPONENT_SCHEMA),
     _validate_sample_rates,
     _validate_tdm_config,
@@ -319,6 +323,7 @@ async def to_code(config):
     cg.add(var.set_task_priority(config[CONF_TASK_PRIORITY]))
     cg.add(var.set_task_core(config[CONF_TASK_CORE]))
     cg.add(var.set_task_stack_size(config[CONF_TASK_STACK_SIZE]))
+    cg.add(var.set_buffers_in_psram(config[CONF_BUFFERS_IN_PSRAM]))
 
     # Link AEC if configured
     if CONF_AEC_ID in config:

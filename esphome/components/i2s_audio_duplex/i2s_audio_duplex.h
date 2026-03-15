@@ -210,6 +210,7 @@ class I2SAudioDuplex : public Component {
   void set_task_priority(uint8_t prio) { this->task_priority_ = prio; }
   void set_task_core(int8_t core) { this->task_core_ = core; }
   void set_task_stack_size(uint32_t size) { this->task_stack_size_ = size; }
+  void set_buffers_in_psram(bool psram) { this->buffers_in_psram_ = psram; }
 
  protected:
   bool init_i2s_duplex_();
@@ -361,6 +362,7 @@ class I2SAudioDuplex : public Component {
   uint8_t task_priority_{19};     // Above lwIP(18), below WiFi(23)
   int8_t task_core_{0};           // Core 0: canonical Espressif AEC pattern; -1 = unpinned
   uint32_t task_stack_size_{8192};
+  bool buffers_in_psram_{false};  // Non-DMA buffers in PSRAM (saves ~15KB internal RAM)
 
   // Error propagation: set by audio_task_ on persistent I2S failures
   std::atomic<bool> has_i2s_error_{false};

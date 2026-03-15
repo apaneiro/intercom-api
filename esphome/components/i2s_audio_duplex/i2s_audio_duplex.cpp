@@ -652,12 +652,17 @@ void I2SAudioDuplex::audio_task_() {
   // AEC buffers use 16-byte alignment (ESP-SR may use SIMD internally)
   static constexpr size_t AEC_ALIGN = 16;
 
+  // DMA buffers MUST be in internal RAM (I2S DMA controller requirement).
+  // Non-DMA buffers use PSRAM when buffers_in_psram_ is set (saves ~15KB internal RAM,
+  // enables SR_LOW_COST AEC mode with 512-sample frames on memory-constrained devices).
+  const uint32_t buf_caps = this->buffers_in_psram_ ? MALLOC_CAP_SPIRAM : MALLOC_CAP_INTERNAL;
+
   ctx.rx_buffer = static_cast<int16_t *>(
       heap_caps_malloc(ctx.rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
   ctx.mic_separate = (ctx.ratio > 1) || ctx.use_stereo_aec_ref || ctx.use_tdm_ref;
   ctx.mic_buffer = ctx.mic_separate
-      ? static_cast<int16_t *>(heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL))
+      ? static_cast<int16_t *>(heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, buf_caps))
       : ctx.rx_buffer;
 
   ctx.spk_buffer = static_cast<int16_t *>(
@@ -665,17 +670,17 @@ void I2SAudioDuplex::audio_task_() {
 
   if (ctx.use_stereo_aec_ref || ctx.use_tdm_ref) {
     ctx.spk_ref_buffer = static_cast<int16_t *>(
-        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
+        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, buf_caps));
   }
 
   if (ctx.use_stereo_aec_ref && ctx.ratio > 1) {
-    ctx.deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    ctx.deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    ctx.deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, buf_caps));
+    ctx.deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, buf_caps));
   }
 
   if (ctx.use_tdm_ref && ctx.ratio > 1) {
-    ctx.tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
-    ctx.tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
+    ctx.tdm_deint_mic = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, buf_caps));
+    ctx.tdm_deint_ref = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, buf_caps));
   }
 
   if (ctx.use_tdm_ref) {
@@ -688,11 +693,11 @@ void I2SAudioDuplex::audio_task_() {
   if (this->aec_ != nullptr) {
     if (!ctx.spk_ref_buffer && !ctx.use_tdm_ref)
       ctx.spk_ref_buffer = static_cast<int16_t *>(
-          heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
+          heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, buf_caps));
     ctx.aec_output = static_cast<int16_t *>(
-        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, MALLOC_CAP_INTERNAL));
+        heap_caps_aligned_alloc(AEC_ALIGN, ctx.out_frame_bytes, buf_caps));
     if (!ctx.use_stereo_aec_ref && !ctx.use_tdm_ref) {
-      ctx.ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, MALLOC_CAP_INTERNAL));
+      ctx.ref_bus_buffer = static_cast<int16_t *>(heap_caps_malloc(ctx.bus_frame_bytes, buf_caps));
     }
   }
 #endif
