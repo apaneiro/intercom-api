@@ -200,7 +200,7 @@ audio_adc:
 esp_aec:
   id: aec_processor
   sample_rate: 16000       # AEC always at 16kHz (= output_sample_rate)
-  mode: voip_low_cost
+  mode: sr_low_cost
   filter_length: 4         # 64ms tail — sufficient for integrated codec path
   # AVOID sr_high_perf: exhausts DMA memory on ESP32-S3 → SPI err 101
 
@@ -348,7 +348,7 @@ media_player:
 # =============================================================================
 micro_wake_word:
   id: mww
-  microphone: mic_raw    # Pre-AEC: hears voice through TTS echo
+  microphone: mic_aec    # Post-AEC: SR mode (linear, no RES) preserves spectral features for MWW
   on_wake_word_detected:
     # Duck media audio so mic hears user clearly
     - mixer_speaker.apply_ducking:

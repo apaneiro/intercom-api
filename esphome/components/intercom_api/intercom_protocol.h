@@ -40,9 +40,9 @@ enum class ErrorCode : uint8_t {
 static constexpr uint32_t SAMPLE_RATE = 16000;
 static constexpr uint8_t BITS_PER_SAMPLE = 16;
 static constexpr uint8_t CHANNELS = 1;
-static constexpr size_t AUDIO_CHUNK_SIZE = 512;      // bytes per chunk
-static constexpr size_t SAMPLES_PER_CHUNK = 256;     // 512 bytes / 2 bytes per sample
-static constexpr uint32_t CHUNK_DURATION_MS = 16;    // 256 samples at 16kHz
+static constexpr size_t AUDIO_CHUNK_SIZE = 1024;     // bytes per chunk (32ms @ 16kHz mono 16-bit)
+static constexpr size_t SAMPLES_PER_CHUNK = 512;     // 1024 bytes / 2 bytes per sample
+static constexpr uint32_t CHUNK_DURATION_MS = 32;    // 512 samples at 16kHz — matches AEC frame
 
 // Protocol header
 struct __attribute__((packed)) MessageHeader {
@@ -57,7 +57,7 @@ static constexpr size_t MAX_MESSAGE_SIZE = HEADER_SIZE + MAX_AUDIO_CHUNK + 64;
 
 // Buffer sizes
 static constexpr size_t RX_BUFFER_SIZE = 8192;       // ~256ms - fits 4 browser chunks
-static constexpr size_t TX_BUFFER_SIZE = 2048;       // ~64ms of audio
+static constexpr size_t TX_BUFFER_SIZE = 4096;       // ~128ms of audio (4 chunks @ 32ms)
 
 // AEC reference delay: compensate for I2S DMA latency + acoustic path
 // The mic captures echo from audio played ~60-100ms ago, but reference is "fresh".

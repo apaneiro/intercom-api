@@ -657,8 +657,10 @@ void I2SAudioDuplex::audio_task_() {
   // enables SR_LOW_COST AEC mode with 512-sample frames on memory-constrained devices).
   const uint32_t buf_caps = this->buffers_in_psram_ ? MALLOC_CAP_SPIRAM : MALLOC_CAP_INTERNAL;
 
+  // ESP-IDF new I2S driver uses memcpy between internal DMA buffers and user buffers.
+  // User buffers do NOT need MALLOC_CAP_DMA — verified in i2s_common.c:1337,1387.
   ctx.rx_buffer = static_cast<int16_t *>(
-      heap_caps_malloc(ctx.rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+      heap_caps_malloc(ctx.rx_frame_bytes, buf_caps));
 
   ctx.mic_separate = (ctx.ratio > 1) || ctx.use_stereo_aec_ref || ctx.use_tdm_ref;
   ctx.mic_buffer = ctx.mic_separate
@@ -666,7 +668,7 @@ void I2SAudioDuplex::audio_task_() {
       : ctx.rx_buffer;
 
   ctx.spk_buffer = static_cast<int16_t *>(
-      heap_caps_malloc(ctx.bus_frame_size * ctx.num_ch * ctx.i2s_bps, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+      heap_caps_malloc(ctx.bus_frame_size * ctx.num_ch * ctx.i2s_bps, buf_caps));
 
   if (ctx.use_stereo_aec_ref || ctx.use_tdm_ref) {
     ctx.spk_ref_buffer = static_cast<int16_t *>(
@@ -686,7 +688,7 @@ void I2SAudioDuplex::audio_task_() {
   if (ctx.use_tdm_ref) {
     ctx.tdm_tx_frame_bytes = ctx.bus_frame_size * ctx.tdm_total_slots * ctx.i2s_bps;
     ctx.tdm_tx_buffer = static_cast<int16_t *>(
-        heap_caps_malloc(ctx.tdm_tx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        heap_caps_malloc(ctx.tdm_tx_frame_bytes, buf_caps));
   }
 
 #ifdef USE_ESP_AEC
