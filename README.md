@@ -1009,7 +1009,9 @@ actions:
         - wait_for_trigger:
             - trigger: event
               event_type: mobile_app_notification_action
-          timeout:
+            - trigger: template
+              value_template: "{{ not is_state(intercom_state, 'Outgoing') }}"
+           timeout:
             hours: 0
             minutes: 0
             seconds: 10
@@ -1030,6 +1032,15 @@ actions:
                     title: 🔔 Call Declined
                     message: "⛔ Call from {{ trigger.event.data.caller }} was declined "
                     notification_id: intercom_call_declined
+            - conditions:
+                - condition: template
+                  value_template: "{{ is_state(intercom_state, 'Idle') }}"
+              sequence:
+                - action: persistent_notification.create
+                  metadata: {}
+                  data:
+                    title: 🔔 Call Missed
+                    message: 📞📵 Call missed from {{ trigger.event.data.caller }}
         - delay:
             hours: 0
             minutes: 0
