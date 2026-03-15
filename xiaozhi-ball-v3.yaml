@@ -1587,7 +1587,7 @@ binary_sensor:
                 lambda: |-
                   if (id(current_mode) != 1) return false;
                   auto s = id(intercom).get_state_str();
-                  return s == "Ringing" || s == "Incoming";
+                  return s == "Ringing" || s == "Incoming" || s == "Outgoing";
               then:
                 - button.press: decline_button
               else:
@@ -3083,7 +3083,7 @@ lvgl:
                   text_color: 0xFF0000
                   text_font: ic_icons
             on_short_click:
-              - button.press: call_button
+              - button.press: decline_button
               
     # ========================================================================
     # INTERCOM: IN CALL PAGE
