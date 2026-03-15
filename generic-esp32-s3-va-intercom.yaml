@@ -100,12 +100,17 @@ psram:
   mode: quad
   speed: 80MHz
 
+preferences:
+  flash_write_interval: 5min
+
 # =============================================================================
 # CONNECTIVITY
 # =============================================================================
 api:
   on_client_connected:
-    - lambda: 'id(intercom).publish_entity_states();'
+    - lambda: |-
+        id(intercom).publish_entity_states();
+        id(speaker_media_player).publish_state();
   on_client_disconnected:
     - voice_assistant.stop:
 
@@ -223,14 +228,30 @@ media_player:
       sample_rate: 16000
       format: FLAC
     files:
+      - id: timer_finished_sound
+        file: sounds/timer_finished.flac
       - id: intercom_ringing_sound
         file: sounds/ringtone.flac
+    on_announcement:
+      - if:
+          condition:
+            intercom_api.is_idle: intercom
+          then:
+            - light.turn_on:
+                id: status_led
+                red: 30%
+                green: 30%
+                blue: 70%
+                brightness: 60%
+                effect: "Fast Pulse"
     on_play:
       - script.execute: restore_led
     on_pause:
       - media_player.stop:
     on_idle:
       - light.turn_off: status_led
+      - delay: 300ms
+      - script.execute: restore_led
 
 # =============================================================================
 # AEC (Acoustic Echo Cancellation)
@@ -238,8 +259,8 @@ media_player:
 esp_aec:
   id: aec_processor
   sample_rate: 16000
-  filter_length: 8
-  mode: voip_high_perf
+  filter_length: 4
+  mode: sr_low_cost
 
 # =============================================================================
 # WAKE WORD + VOICE ASSISTANT
@@ -554,51 +575,80 @@ script:
     then:
       - if:
           condition:
-            switch.is_on: mute
+            and:
+              - switch.is_on: mute
+              - switch.is_on: speaker_mute
           then:
+            # Both muted — red slow pulse
             - light.turn_on:
                 id: status_led
                 red: 100%
                 green: 0%
                 blue: 0%
-                brightness: 30%
-                effect: none
+                brightness: 40%
+                effect: "Slow Pulse"
           else:
             - if:
                 condition:
-                  or:
-                    - intercom_api.is_ringing: intercom
-                    - intercom_api.is_incoming: intercom
+                  switch.is_on: mute
                 then:
-                  - logger.log: "restore_led: ringing, keeping strobe"
+                  # Mic muted — red dim
+                  - light.turn_on:
+                      id: status_led
+                      red: 100%
+                      green: 0%
+                      blue: 0%
+                      brightness: 30%
+                      effect: none
                 else:
                   - if:
                       condition:
-                        intercom_api.is_in_call: intercom
+                        switch.is_on: speaker_mute
                       then:
+                        # Speaker muted — orange dim
                         - light.turn_on:
                             id: status_led
-                            red: 30%
-                            green: 69%
-                            blue: 31%
-                            brightness: 100%
+                            red: 100%
+                            green: 50%
+                            blue: 0%
+                            brightness: 30%
                             effect: none
                       else:
                         - if:
                             condition:
                               or:
-                                - media_player.is_announcing:
-                                - media_player.is_playing:
+                                - intercom_api.is_ringing: intercom
+                                - intercom_api.is_incoming: intercom
                             then:
-                              - light.turn_on:
-                                  id: status_led
-                                  red: 0%
-                                  green: 100%
-                                  blue: 0%
-                                  brightness: 100%
-                                  effect: "Slow Pulse"
+                              - logger.log: "restore_led: ringing, keeping strobe"
                             else:
-                              - light.turn_off: status_led
+                              - if:
+                                  condition:
+                                    intercom_api.is_in_call: intercom
+                                  then:
+                                    - light.turn_on:
+                                        id: status_led
+                                        red: 30%
+                                        green: 69%
+                                        blue: 31%
+                                        brightness: 100%
+                                        effect: none
+                                  else:
+                                    - if:
+                                        condition:
+                                          or:
+                                            - media_player.is_announcing:
+                                            - media_player.is_playing:
+                                        then:
+                                          - light.turn_on:
+                                              id: status_led
+                                              red: 0%
+                                              green: 100%
+                                              blue: 0%
+                                              brightness: 100%
+                                              effect: "Slow Pulse"
+                                        else:
+                                          - light.turn_off: status_led
 
   - id: intercom_ringing_loop
     mode: restart
@@ -683,15 +733,11 @@ switch:
 
   - platform: template
     id: mute
-    name: "Mic Mute"
-    icon: "mdi:microphone-off"
+    name: Mic Mute
+    icon: mdi:microphone-off
     optimistic: true
     restore_mode: ALWAYS_OFF
     on_turn_on:
-      - logger.log:
-          level: INFO
-          tag: mute
-          format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
       - voice_assistant.stop:
       - microphone.mute:
@@ -706,13 +752,9 @@ switch:
       - delay: 2s
       - script.execute: restore_led
     on_turn_off:
-      - logger.log:
-          level: INFO
-          tag: mute
-          format: "Mic mute OFF — microphone active, MWW started"
       - microphone.unmute:
           id: mic_component
-      - micro_wake_word.start:
+      - script.execute: start_wake_word
       - light.turn_on:
           id: status_led
           red: 0%
@@ -723,21 +765,65 @@ switch:
       - delay: 2s
       - script.execute: restore_led
 
+  # Speaker Mute — software mute on hw_speaker
+  - platform: template
+    name: Speaker Mute
+    id: speaker_mute
+    icon: mdi:volume-off
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - speaker.mute_on: hw_speaker
+      - light.turn_on:
+          id: status_led
+          red: 100%
+          green: 50%
+          blue: 0%
+          brightness: 60%
+          effect: "Fast Pulse"
+      - delay: 2s
+      - script.execute: restore_led
+    on_turn_off:
+      - speaker.mute_off: hw_speaker
+      - light.turn_on:
+          id: status_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 60%
+          effect: "Fast Pulse"
+      - delay: 2s
+      - script.execute: restore_led
+
+  # MWW active status + control
+  - platform: template
+    name: Wake Word
+    id: wake_word_switch
+    icon: mdi:account-voice
+    restore_mode: DISABLED
+    lambda: 'return id(mww).is_running();'
+    turn_on_action:
+      - if:
+          condition:
+            not:
+              lambda: 'return id(mww).is_running();'
+          then:
+            - micro_wake_word.start:
+    turn_off_action:
+      - micro_wake_word.stop:
+
 # =============================================================================
 # NUMBERS
 # =============================================================================
 number:
   - platform: intercom_api
     intercom_api_id: intercom
-    speaker_volume:
-      id: speaker_volume
-      name: "Speaker Volume"
     mic_gain:
       id: mic_gain
       name: "Mic Gain"
 
 # =============================================================================
-# STATUS LED (SK6812 RGB on GPIO38, onboard)
+# STATUS LED (SK6812 RGB on GPIO33)
 # =============================================================================
 light:
   - platform: esp32_rmt_led_strip
