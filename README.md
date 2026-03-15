@@ -814,12 +814,14 @@ See the [i2s_audio_duplex README](esphome/components/i2s_audio_duplex/README.md)
   </tr>
 </table>
 
-The Voice Assistant and Intercom coexist seamlessly on the same hardware: shared microphone, shared speaker (via audio mixer), shared wake word detection. No display required (works on headless devices like the Waveshare S3 Audio); on devices with a screen, you also get a full touch UI:
+The Voice Assistant, Micro Wake Word, and Intercom coexist seamlessly on the same hardware: shared microphone, shared speaker (via 3-source audio mixer with ducking), always-on wake word detection. No display required (works on headless devices like the Waveshare S3 Audio); on devices with a screen, you also get a full touch UI:
 
-- **Always listening**: Micro Wake Word runs continuously on raw (pre-AEC) audio, detecting the wake word even while TTS is playing or during an intercom call
+- **Always listening**: Micro Wake Word runs continuously on **post-AEC** audio (`stop_after_detection: false`). SR linear AEC preserves the spectral features that the neural wake word model relies on (10/10 detection vs 2/10 with VOIP AEC modes). MWW detects the wake word even while TTS is playing, during music, or during an intercom call
+- **Audio ducking**: When the wake word is detected, background music automatically ducks (-20dB). Volume restores when the VA cycle ends. During intercom calls, music is also ducked. The 3-source mixer (media + TTS + intercom) enables independent volume control per source
+- **Barge-in**: Say the wake word during a TTS response to interrupt and ask a new question. The barge-in state machine (`restart_intent` flag + `va_end_handler` script with `mode: restart`) ensures clean pipeline teardown and restart, waiting for VA to reach IDLE before restarting (`voice_assistant.start` is silently ignored if not IDLE)
 - **Touch or voice**: Start the assistant by saying the wake word or tapping the screen (on touch displays)
-- **Barge-in**: Say the wake word during a TTS response to interrupt and ask a new question
-- **Intercom calls**: Call other devices or Home Assistant with one tap; incoming calls ring with audio + visual feedback
+- **Intercom calls**: Call other devices or Home Assistant with one tap; incoming calls ring with audio + visual feedback. Ringtone plays over music (via announcement pipeline)
+- **Runtime AEC mode switching**: An `AEC Mode` select entity in Home Assistant lets you switch between SR and VOIP AEC modes at runtime without reflashing
 - **Weather at a glance**: Current conditions, temperature, and 5-day forecast updated automatically (touch displays)
 - **Mood-aware responses**: The assistant shows different expressions (happy, neutral, angry) based on the tone of its reply. Requires instructing your LLM to prepend an ASCII emoticon (`:-)` `:-(` `:-|`) to each response based on its tone
 - **Custom AI avatars**: On devices with a display, you can create your own assistant avatar by providing a set of PNG images in a standard folder structure. Set the `ai_avatar` substitution in your YAML to pick which avatar to use:
@@ -851,7 +853,7 @@ The Voice Assistant and Intercom coexist seamlessly on the same hardware: shared
 
 AEC uses Espressif's closed-source ESP-SR library. All modes have similar CPU cost per frame (~7ms out of 16ms budget). The difference is primarily in memory allocation and adaptive filter quality.
 
-**Recommended: `sr_low_cost`** for VA + MWW setups. Linear-only AEC preserves spectral features for neural wake word detection (10/10 vs 2/10 with VOIP modes). Also uses ~60% less CPU. Requires `buffers_in_psram: true` on ESP32-S3.
+**Recommended: `sr_low_cost`** for VA + MWW setups (i2s_audio_duplex devices). Linear-only AEC preserves spectral features for neural wake word detection (10/10 vs 2/10 with VOIP modes). Also uses ~60% less CPU. Requires `buffers_in_psram: true` on ESP32-S3. For dual-bus devices without i2s_audio_duplex, use `voip_high_perf` (AEC runs inside intercom_api).
 
 ```yaml
 esp_aec:
@@ -892,7 +894,7 @@ micro_wake_word:
 
 ### LVGL Display
 
-Running a display alongside Voice Assistant, Micro Wake Word, AEC, and intercom on a single ESP32-S3 is challenging due to RAM and CPU constraints. The `xiaozhi-ball-v3.yaml` and `waveshare-p4-touch-lcd-va-intercom.yaml` configs demonstrate proven approaches using **LVGL** (Light and Versatile Graphics Library):
+Running a display alongside Voice Assistant, Micro Wake Word, AEC, and intercom on a single ESP32-S3 is challenging due to RAM and CPU constraints. The `xiaozhi-ball-v3-va-intercom.yaml` and `waveshare-p4-touch-lcd-va-intercom.yaml` configs demonstrate proven approaches using **LVGL** (Light and Versatile Graphics Library):
 
 | Before (ili9xxx manual) | After (LVGL) |
 |---|---|
@@ -1102,7 +1104,7 @@ Working configs tested on real hardware are included in the repository:
 
 | File | Device | Features |
 |------|--------|----------|
-| [`xiaozhi-ball-v3.yaml`](xiaozhi-ball-v3.yaml) | Xiaozhi Ball V3 (ES8311) | VA + MWW + Intercom + LVGL display + 48kHz audio |
+| [`xiaozhi-ball-v3-va-intercom.yaml`](xiaozhi-ball-v3-va-intercom.yaml) | Xiaozhi Ball V3 (ES8311) | VA + MWW + Intercom + LVGL display + 48kHz audio |
 | [`xiaozhi-ball-v3-intercom.yaml`](xiaozhi-ball-v3-intercom.yaml) | Xiaozhi Ball V3 (ES8311) | Intercom only, C++ display |
 | [`waveshare-s3-audio-va-intercom.yaml`](waveshare-s3-audio-va-intercom.yaml) | Waveshare ESP32-S3-AUDIO (ES8311 + ES7210) | VA + MWW + Intercom + TDM AEC + LED feedback |
 | [`waveshare-p4-touch-lcd-va-intercom.yaml`](waveshare-p4-touch-lcd-va-intercom.yaml) | Waveshare ESP32-P4-WiFi6-Touch-LCD-10.1 (ES8311 + ES7210) | VA + MWW + Intercom + LVGL 10.1" touch split-screen (weather + intercom tileview, touch-to-talk VA with mood images, 5-day forecast) + ringtone |
