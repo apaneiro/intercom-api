@@ -311,6 +311,7 @@ media_player:
       # Stop immediately to free resources — HA can re-send URL if needed.
       - media_player.stop:
     on_idle:
+      - delay: 200ms
       - script.execute: restore_led
 
 # =============================================================================
@@ -326,7 +327,7 @@ micro_wake_word:
         id: media_speaker_mix
         decibel_reduction: 20
         duration: 200ms
-    # Barge-in: if VA/TTS active, stop and restart
+    # Barge-in: if VA/TTS active, stop and let va_end_handler restart VA
     - if:
         condition:
           or:
@@ -339,12 +340,10 @@ micro_wake_word:
           - voice_assistant.stop:
           - media_player.stop:
               announcement: true
-          - delay: 500ms
-    - voice_assistant.start:
-        wake_word: !lambda return wake_word;
-    - globals.set:
-        id: restart_intent
-        value: "false"
+        else:
+          # Fresh start (no VA running)
+          - voice_assistant.start:
+              wake_word: !lambda return wake_word;
   models:
     - model: "wakewords/hey_trowyayoh.json"
       probability_cutoff: ${wake_word_probability_cutoff}
@@ -598,12 +597,16 @@ script:
                 announcement: true
       - delay: 100ms
       - voice_assistant.stop:
-      # Release audio focus only if NOT a barge-in
+      # Barge-in: restart VA. Otherwise release audio focus.
       - if:
           condition:
-            not:
-              lambda: 'return id(restart_intent);'
+            lambda: 'return id(restart_intent);'
           then:
+            - globals.set:
+                id: restart_intent
+                value: "false"
+            - voice_assistant.start:
+          else:
             - mixer_speaker.apply_ducking:
                 id: media_speaker_mix
                 decibel_reduction: 0

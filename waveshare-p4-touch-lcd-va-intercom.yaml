@@ -29,8 +29,7 @@
 # Audio pipeline (i2s_audio_duplex at 48kHz, TDM + FIR decimation to 16kHz):
 #
 #   ES7210 TDM [mic1, mic2, ref, nc] → FIR x3 ──┐
-#                                               ├── AEC(mic, ref) → mic_aec → VA / Intercom TX
-#                                               └── mic_raw (pre-AEC) → MWW
+#                                               └── AEC (SR linear) → mic_aec → VA / Intercom TX / MWW
 #
 #   Music/radio → media_speaker (resampler) ───────────┐
 #   VA TTS      → tts_speaker (resampler) ─────────────┼── mixer (48kHz) → hw_speaker → ES8311
@@ -82,8 +81,9 @@ esphome:
     - priority: 200
       then:
         # === ES7210 TDM Configuration ===
-        # Enable all 4 ADC clocks, TDM mode, and set MIC3 gain to 0dB.
-        # MIC3 is wired to ES8311 DAC output (line level AEC reference).
+        # Enable all 4 ADC clocks, TDM mode, and set MIC3 gain.
+        # MIC3 is wired to ES8311 DAC output via analog path (AEC reference).
+        # Gain reference: Espressif Korvo-2 AEC example uses GAIN_30DB for MIC3.
         - lambda: |-
             // 1. Enable ALL ADC clocks (ESPHome driver only enables ADC1+2)
             uint8_t reg01;
@@ -94,12 +94,12 @@ esphome:
             // 2. Enable TDM I2S mode: all 4 ADC channels multiplexed on SDOUT1
             id(es7210_adc).write_byte(0x12, 0x02);
 
-            // 3. MIC3 gain = 0dB (line level from ES8311 DAC output)
+            // 3. MIC3 gain = 30dB (Espressif Korvo-2 reference: GAIN_30DB for AEC ref)
             //    MIC1/MIC2 keep 24dB from ESPHome driver (MEMS mic preamp)
-            id(es7210_adc).write_byte(0x45, 0x10);  // MIC3: PGA_ON + 0dB
+            id(es7210_adc).write_byte(0x45, 0x1A);  // MIC3: PGA_ON + 30dB
             id(es7210_adc).write_byte(0x46, 0x10);  // MIC4: PGA_ON + 0dB (unused, keep tidy)
 
-            ESP_LOGI("es7210_tdm", "TDM config applied: clk=0x%02X, sdp2=0x02, MIC3 gain=0dB", reg01);
+            ESP_LOGI("es7210_tdm", "TDM config applied: clk=0x%02X, sdp2=0x02, MIC3 gain=30dB", reg01);
         # Restore ES8311 volume and sync AEC reference
         - lambda: |-
             float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
@@ -253,7 +253,7 @@ audio_adc:
 esp_aec:
   id: aec_processor
   sample_rate: 16000       # AEC always at 16kHz (= output_sample_rate)
-  mode: voip_low_cost
+  mode: sr_low_cost        # Linear AEC — preserves spectral features for MWW
   filter_length: 4         # 64ms tail — sufficient for integrated codec path
 
 i2s_audio_duplex:
@@ -270,17 +270,14 @@ i2s_audio_duplex:
   tdm_total_slots: 4
   tdm_mic_slot: 0              # ES7210 TDM slot 0 = ADC1 (MIC1, voice)
   tdm_ref_slot: 1              # ES7210 TDM slot 1 = ADC3 (MIC3, ES8311 DAC feedback)
+  buffers_in_psram: true       # All audio buffers in PSRAM — required for sr_low_cost
 
-# mic_aec: post-AEC, for VA STT and intercom TX
-# mic_raw: pre-AEC, for MWW (neural model handles speaker echo better)
+# mic_aec: post-AEC for VA STT, intercom TX, AND MWW
+# SR linear AEC preserves spectral features for neural wake word detection.
 microphone:
   - platform: i2s_audio_duplex
     id: mic_aec
     i2s_audio_duplex_id: i2s_duplex
-  - platform: i2s_audio_duplex
-    id: mic_raw
-    i2s_audio_duplex_id: i2s_duplex
-    pre_aec: true
 
 # Speaker pipeline: i2s_audio_duplex → resampler → mixer (all at 48kHz)
 speaker:
@@ -417,7 +414,8 @@ media_player:
 # =============================================================================
 micro_wake_word:
   id: mww
-  microphone: mic_raw
+  microphone: mic_aec
+  stop_after_detection: false
   on_wake_word_detected:
     - script.execute: backlight_timer
     # Duck media audio so mic hears user clearly
@@ -2614,7 +2612,6 @@ switch:
           format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
       - microphone.mute: mic_aec
-      - microphone.mute: mic_raw
       - globals.set:
           id: voice_assistant_phase
           value: '${voice_assist_muted_phase_id}'
@@ -2625,7 +2622,6 @@ switch:
           tag: mute
           format: "Mic mute OFF — microphone active, MWW started"
       - microphone.unmute: mic_aec
-      - microphone.unmute: mic_raw
       - globals.set:
           id: voice_assistant_phase
           value: '${voice_assist_idle_phase_id}'
