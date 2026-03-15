@@ -20,7 +20,6 @@
 #
 #   ES7210 TDM slot 0 (MIC1)         → FIR x3 ──┐
 #   ES7210 TDM slot 1 (MIC3=DAC ref) → FIR x3 ──┼── AEC (SR linear) → mic_aec → VA / Intercom TX / MWW
-#                                                 └── mic_raw (pre-AEC, diagnostics only)
 #
 #   Music/radio → media_speaker (resampler) ───────────┐
 #   VA TTS      → tts_speaker (resampler) ─────────────┼── mixer (48kHz) → hw_speaker → ES8311 DAC
@@ -234,16 +233,12 @@ i2s_audio_duplex:
 # =============================================================================
 # Microphone (ES7210 ADC, 16kHz output after FIR decimation)
 # =============================================================================
-# mic_aec: post-AEC for VA STT, intercom TX, AND MWW (SR linear AEC preserves spectral features)
-# mic_raw: pre-AEC fallback (kept for diagnostics; not used in normal operation)
+# mic_aec: post-AEC for VA STT, intercom TX, AND MWW
+# SR linear AEC (esp_aec3) preserves spectral features for neural wake word detection.
 microphone:
   - platform: i2s_audio_duplex
     id: mic_aec
     i2s_audio_duplex_id: i2s_duplex
-  - platform: i2s_audio_duplex
-    id: mic_raw
-    i2s_audio_duplex_id: i2s_duplex
-    pre_aec: true
 
 # =============================================================================
 # Speaker Pipeline: i2s_audio_duplex → resampler → mixer (all at 48kHz)
@@ -929,7 +924,6 @@ switch:
           format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
       - microphone.mute: mic_aec
-      - microphone.mute: mic_raw
       - light.turn_on:
           id: status_led
           red: 100%
@@ -945,7 +939,6 @@ switch:
           tag: mute
           format: "Mic mute OFF — microphone active, MWW started"
       - microphone.unmute: mic_aec
-      - microphone.unmute: mic_raw
       - script.execute: start_wake_word
       - light.turn_on:
           id: status_led
