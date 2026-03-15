@@ -32,8 +32,7 @@
 # Audio pipeline (i2s_audio_duplex at 48kHz, stereo AEC reference):
 #
 #   I2S RX 48kHz stereo → L=ref R=mic → FIR x3 ──┐
-#                                                ├── AEC → mic_aec → VA / Intercom TX
-#                                                └── mic_raw (pre-AEC) → MWW
+#                                                └── AEC (SR linear) → mic_aec → VA / Intercom TX / MWW
 #
 #   Music/radio → media_speaker (resampler) ───────────┐
 #   VA TTS      → tts_speaker (resampler) ─────────────┼── mixer (48kHz) → hw_speaker → ES8311
@@ -50,16 +49,16 @@
 # =============================================================================
 
 substitutions:
-  name: palletta
-  friendly_name: Palletta
+  name: xiaozhi-ball-v3
+  friendly_name: Xiaozhi Ball V3 LVGL
 
   # ---- Remote mode (for users, just download and flash) ----
-  # assets_base: "https://github.com/n-IA-hane/intercom-api/raw/dev/"
+  assets_base: "https://github.com/n-IA-hane/intercom-api/raw/dev/"
   # ---- Local mode (for development, clone repo first) ----
-  assets_base: ""
+  # assets_base: ""
 
   # AI avatar folder (${assets_base}images/assistant/<ai_avatar>/)
-  ai_avatar: f_off
+  ai_avatar: troiaio
 
   # Wake word sensitivity (per-device tuning)
   wake_word_probability_cutoff: "0.60"
@@ -127,7 +126,7 @@ esphome:
       - lambda: |-
           float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
           id(es8311_dac).set_volume(vol);
-          id(i2s_duplex).set_aec_reference_volume(vol);
+
           id(peer_name) = id(intercom).get_current_destination();
       - micro_wake_word.start:
       - delay: 30s
@@ -160,10 +159,6 @@ psram:
 # EXTERNAL COMPONENTS
 # =============================================================================
 # Remote:
-# external_components:
-#   - source: github://n-IA-hane/intercom-api@dev
-#     components: [intercom_api, i2s_audio_duplex, esp_aec]
-# Local:
 external_components:
   - source:
       type: local
@@ -253,27 +248,18 @@ audio_dac:
     mic_gain: 24DB
 
 # =============================================================================
-# ECHO CANCELLATION (ESP-SR library, closed-source Espressif)
+# ECHO CANCELLATION (ESP-SR)
 #
-# AEC modes tested on ESP32-S3 with ES8311 + MWW + Voice Assistant:
-#   - sr_high_perf:   AVOID - exhausts DMA memory, causes SPI err 101
-#   - voip_high_perf: Works but heavy CPU (~50% of Core 1 per frame)
-#   - voip_low_cost:  Recommended - same CPU as high_perf but lighter memory
-#
-# filter_length controls echo tail (N * 16ms). Higher = better cancellation
-# but NO impact on CPU (ESP-SR cost is fixed per frame regardless of length).
-# Tested: filter_length 8 (128ms) vs 4 (64ms) = identical CPU (~7ms/frame).
-# Use 4 for integrated codecs (ES8311, short echo path).
-# Use 8 for separate mic+speaker setups (longer acoustic path).
-#
-# CPU impact: AEC costs ~7ms per 16ms frame = ~42% of Core 1.
-# audio_task uses vTaskDelay(3) to yield CPU to MWW and main loop.
+# sr_low_cost: Linear-only AEC (esp_aec3 engine, no residual echo suppressor).
+#   Preserves spectral features for MWW neural detection (10/10 vs 2/10 with VOIP).
+#   Uses ~60% less CPU than VOIP modes (22% vs 58%).
+#   Frame size: 512 samples (32ms) — requires buffers_in_psram.
 # =============================================================================
 esp_aec:
   id: aec_component
   sample_rate: 16000
   filter_length: 4     # 64ms echo tail (sufficient for integrated codec)
-  mode: voip_low_cost   # Lightest mode, same quality as high_perf on ESP32-S3
+  mode: sr_low_cost    # Linear AEC — preserves spectral features for MWW
 
 # =============================================================================
 # I2S AUDIO DUPLEX (single bus for ES8311)
@@ -297,26 +283,17 @@ i2s_audio_duplex:
   # Requires ES8311 register 0x44 bits[6:4]=4 (configured in on_boot via I2C).
   use_stereo_aec_reference: true
   aec_reference_delay_ms: 10   # Minimal (sample-aligned via stereo feedback)
+  buffers_in_psram: true       # All audio buffers in PSRAM — required for sr_low_cost (512-sample frames)
 
 # =============================================================================
-# MICROPHONES
-# Two instances on the same I2S bus, different audio paths:
-#   mic_aec (post-AEC): Echo-cancelled audio for VA STT and intercom TX.
-#     AEC removes speaker echo so the remote peer / STT engine hears only voice.
-#   mic_raw (pre-AEC):  Raw mic signal for MWW wake word detection.
-#     MWW needs raw audio because AEC suppresses voice during TTS playback,
-#     making wake word detection unreliable (tested: 1/10 detections with AEC).
-#     The neural MWW model handles speaker echo better than AEC-suppressed audio.
-# Both share the same I2S RX via callback broadcast (no extra task/CPU cost).
+# MICROPHONE
+# Single mic_aec: SR linear AEC preserves spectral features for all consumers
+# (VA STT, intercom TX, MWW). No mic_raw needed with sr_low_cost mode.
 # =============================================================================
 microphone:
   - platform: i2s_audio_duplex
     id: mic_aec
     i2s_audio_duplex_id: i2s_duplex
-  - platform: i2s_audio_duplex
-    id: mic_raw
-    i2s_audio_duplex_id: i2s_duplex
-    pre_aec: true
 
 
 # =============================================================================
@@ -396,16 +373,6 @@ media_player:
                 red: 0.00
                 green: 0.00
                 blue: 1.00
-      # Restart MWW for barge-in support during TTS (but NOT during intercom calls)
-      - if:
-          condition:
-            and:
-              - switch.is_off: mute
-              - intercom_api.is_idle: intercom
-              - not:
-                  voice_assistant.is_running:
-          then:
-            - micro_wake_word.start:
       # Set replying phase for non-VA announcements (e.g., timer sound)
       - if:
           condition:
@@ -444,16 +411,6 @@ media_player:
       - media_player.stop:
     on_idle:
       - script.execute: backlight_timer
-      # Restart MWW after media finishes (but NOT during intercom calls)
-      - if:
-          condition:
-            and:
-              - switch.is_off: mute
-              - intercom_api.is_idle: intercom
-              - not:
-                  voice_assistant.is_running:
-          then:
-            - micro_wake_word.start:
       - if:
           condition:
             and:
@@ -467,33 +424,38 @@ media_player:
 # =============================================================================
 # WAKE WORD & VOICE ASSISTANT
 #
-# MWW uses mic_raw (pre-AEC) for reliable detection even during TTS playback.
-# VA uses mic_aec (post-AEC) for clean STT audio without speaker echo.
-#
-# MWW inference runs as a FreeRTOS task (priority 3, unpinned).
-# With AEC active (~7ms/frame), audio_task yields 3ms via vTaskDelay(3)
-# to ensure MWW gets enough CPU for TFLite micro inference.
+# MWW always-on (stop_after_detection: false) on mic_aec.
+# SR linear AEC preserves spectral features for neural detection (10/10).
+# Ducking managed centrally: acquire in on_wake_word_detected, release in va_end_handler.
 # =============================================================================
 micro_wake_word:
   id: mww
-  microphone: mic_raw    # Pre-AEC: hears voice through TTS echo
+  microphone: mic_aec    # Post-AEC: SR linear AEC preserves spectral features
+  stop_after_detection: false
   on_wake_word_detected:
     - script.execute: backlight_timer
-    # Duck media audio so mic hears user clearly
+    # Acquire audio focus: duck media
     - mixer_speaker.apply_ducking:
         id: media_speaker_mix
         decibel_reduction: 20
         duration: 200ms
-    # Barge-in: if TTS is playing, interrupt it and restart VA
+    # Barge-in: if VA/TTS active, stop and let va_end_handler restart VA
     - if:
         condition:
-          media_player.is_announcing:
+          or:
+            - media_player.is_announcing:
+            - voice_assistant.is_running:
         then:
-          - media_player.stop:
+          - globals.set:
+              id: restart_intent
+              value: "true"
           - voice_assistant.stop:
-          - delay: 100ms
-    - voice_assistant.start:
-        wake_word: !lambda return wake_word;
+          - media_player.stop:
+              announcement: true
+        else:
+          # Fresh start (no VA running)
+          - voice_assistant.start:
+              wake_word: !lambda return wake_word;
   models:
     - model: "${assets_base}wakewords/hey_trowyayoh.json"
       probability_cutoff: ${wake_word_probability_cutoff}
@@ -595,79 +557,16 @@ voice_assistant:
     - script.execute: reply_pagination_timer
     - script.execute: draw_display
   on_end:
-    - wait_until:
-        condition:
-          - media_player.is_announcing:
-        timeout: 0.5s
-    - wait_until:
-        condition:
-          and:
-            - not:
-                media_player.is_announcing:
-            - not:
-                speaker.is_playing:
-                    id: tts_speaker
-        timeout: 30s
-    # Fallback: if states stayed stuck despite component fix, force cleanup
-    - if:
-        condition:
-          or:
-            - media_player.is_announcing:
-            - speaker.is_playing:
-                id: tts_speaker
-        then:
-          - logger.log:
-              level: WARN
-              format: "VA on_end: timeout waiting for TTS drain, forcing cleanup"
-          - media_player.stop:
-              announcement: true
-    - delay: 100ms
-    - voice_assistant.stop:
-    # Restore media volume after VA finishes — but only if no intercom call active
-    - if:
-        condition:
-          intercom_api.is_idle: intercom
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_speaker_mix
-              decibel_reduction: 0
-              duration: 500ms
-    # Restart MWW (resilience: always restart unless muted)
-    - if:
-        condition:
-          switch.is_off: mute
-        then:
-          - micro_wake_word.start:
-    - script.stop: reply_pagination_timer
-    - script.execute: backlight_timer
-    - text_sensor.template.publish:
-        id: text_request
-        state: ""
-    - text_sensor.template.publish:
-        id: text_response
-        state: ""
-    - light.turn_off: led
-    - script.execute: set_idle_or_mute_phase
-    - if:
-        condition:
-          not:
-            intercom_api.is_idle:
-              id: intercom
-        then:
-          - globals.set:
-              id: current_mode
-              value: '1'
-    - script.execute: draw_display
+    - script.execute: va_end_handler
   on_error:
-    # Restore media volume on error — but only if no intercom call active
-    - if:
-        condition:
-          intercom_api.is_idle: intercom
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_speaker_mix
-              decibel_reduction: 0
-              duration: 300ms
+    # Always release audio focus on error
+    - globals.set:
+        id: restart_intent
+        value: "false"
+    - mixer_speaker.apply_ducking:
+        id: media_speaker_mix
+        decibel_reduction: 0
+        duration: 300ms
     - light.turn_on:
         id: led
         brightness: 70%
@@ -683,12 +582,6 @@ voice_assistant:
               value: '${voice_assist_error_phase_id}'
           - script.execute: draw_display
           - delay: 2s
-          # Restart MWW after error (resilience)
-          - if:
-              condition:
-                switch.is_off: mute
-              then:
-                - micro_wake_word.start:
           - script.execute: set_idle_or_mute_phase
           - script.execute: draw_display
   on_client_connected:
@@ -697,11 +590,21 @@ voice_assistant:
         value: 'false'
     - if:
         condition:
-          switch.is_off: mute
+          and:
+            - switch.is_off: mute
+            - not:
+                lambda: 'return id(mww).is_running();'
         then:
           - micro_wake_word.start:
     - script.execute: set_idle_or_mute_phase
     - script.execute: draw_display
+    # Boost MWW task priority (default 3 -> 8)
+    - delay: 1s
+    - lambda: |-
+        TaskHandle_t mww_task = xTaskGetHandle("mww");
+        if (mww_task) {
+          vTaskPrioritySet(mww_task, 8);
+        }
   on_client_disconnected:
     - micro_wake_word.stop:
     - globals.set:
@@ -737,7 +640,6 @@ intercom_api:
   ringing_timeout: 30s
 
   on_outgoing_call:
-    - micro_wake_word.stop:
     - mixer_speaker.apply_ducking:
         id: media_speaker_mix
         decibel_reduction: 20
@@ -768,7 +670,6 @@ intercom_api:
                 type: "doorbell"
 
   on_ringing:
-    - micro_wake_word.stop:
     - mixer_speaker.apply_ducking:
         id: media_speaker_mix
         decibel_reduction: 20
@@ -794,7 +695,6 @@ intercom_api:
 
   on_streaming:
     - script.stop: intercom_ringing_loop
-    - micro_wake_word.stop:
     - mixer_speaker.apply_ducking:
         id: media_speaker_mix
         decibel_reduction: 20
@@ -825,22 +725,12 @@ intercom_api:
 
   on_idle:
     - script.stop: intercom_ringing_loop
-    - if:
-        condition:
-          not:
-            voice_assistant.is_running:
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_speaker_mix
-              decibel_reduction: 0
-              duration: 500ms
+    - mixer_speaker.apply_ducking:
+        id: media_speaker_mix
+        decibel_reduction: 0
+        duration: 500ms
     - light.turn_off: led
     - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
-    - if:
-        condition:
-          switch.is_off: mute
-        then:
-          - micro_wake_word.start:
     # Restore previous mode after call ends
     - if:
         condition:
@@ -856,40 +746,20 @@ intercom_api:
 
   on_hangup:
     - script.stop: intercom_ringing_loop
-    - if:
-        condition:
-          not:
-            voice_assistant.is_running:
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_speaker_mix
-              decibel_reduction: 0
-              duration: 500ms
-    - if:
-        condition:
-          switch.is_off: mute
-        then:
-          - micro_wake_word.start:
+    - mixer_speaker.apply_ducking:
+        id: media_speaker_mix
+        decibel_reduction: 0
+        duration: 500ms
     - logger.log:
         format: "Hangup: %s"
         args: ['reason.c_str()']
 
   on_call_failed:
     - script.stop: intercom_ringing_loop
-    - if:
-        condition:
-          not:
-            voice_assistant.is_running:
-        then:
-          - mixer_speaker.apply_ducking:
-              id: media_speaker_mix
-              decibel_reduction: 0
-              duration: 500ms
-    - if:
-        condition:
-          switch.is_off: mute
-        then:
-          - micro_wake_word.start:
+    - mixer_speaker.apply_ducking:
+        id: media_speaker_mix
+        decibel_reduction: 0
+        duration: 500ms
     - logger.log:
         format: "Call failed: %s"
         args: ['reason.c_str()']
@@ -902,6 +772,10 @@ globals:
     type: bool
     restore_value: false
     initial_value: "true"
+  - id: restart_intent
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
   - id: voice_assistant_phase
     type: int
@@ -959,6 +833,78 @@ globals:
 # SCRIPTS
 # =============================================================================
 script:
+  # VA end handler — mode: restart ensures barge-in cancels previous on_end
+  - id: va_end_handler
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            - media_player.is_announcing:
+          timeout: 0.5s
+      - wait_until:
+          condition:
+            and:
+              - not:
+                  media_player.is_announcing:
+              - not:
+                  speaker.is_playing:
+                      id: tts_speaker
+          timeout: 30s
+      - if:
+          condition:
+            or:
+              - media_player.is_announcing:
+              - speaker.is_playing:
+                  id: tts_speaker
+          then:
+            - logger.log:
+                level: WARN
+                format: "VA: TTS drain timeout, forcing cleanup"
+            - media_player.stop:
+                announcement: true
+      - delay: 100ms
+      - voice_assistant.stop:
+      # Barge-in: restart VA. Otherwise release audio focus + cleanup display.
+      - if:
+          condition:
+            lambda: 'return id(restart_intent);'
+          then:
+            - globals.set:
+                id: restart_intent
+                value: "false"
+            - voice_assistant.start:
+          else:
+            - mixer_speaker.apply_ducking:
+                id: media_speaker_mix
+                decibel_reduction: 0
+                duration: 500ms
+            - light.turn_off: led
+            - script.stop: reply_pagination_timer
+            - script.execute: backlight_timer
+            - text_sensor.template.publish:
+                id: text_request
+                state: ""
+            - text_sensor.template.publish:
+                id: text_response
+                state: ""
+            # Clear replying page text (prevents stale TTS text when music keeps replying_page visible)
+            - lambda: |-
+                id(wrapped_lines_reply).clear();
+                id(reply_total_pages) = 1;
+                id(reply_page_index) = 0;
+            - script.execute: update_replying_text
+            - script.execute: set_idle_or_mute_phase
+            - if:
+                condition:
+                  not:
+                    intercom_api.is_idle:
+                      id: intercom
+                then:
+                  - globals.set:
+                      id: current_mode
+                      value: '1'
+            - script.execute: draw_display
+
   # Idle animation: 38 frames at 120ms = 4.56s, then 25s pause. Repeat while idle.
   - id: ai_animation_loop
     mode: single
@@ -1453,17 +1399,9 @@ script:
               - intercom_api.is_ringing: intercom
               - intercom_api.is_incoming: intercom
           then:
-            # Ringtone only when media pipeline is fully idle (no resources allocated).
-            # PAUSED still holds 20KB internal read_task stack — starting a 2nd
-            # pipeline with insufficient RAM leaves it in a broken state that
-            # freezes the main loop on hangup.
-            - if:
-                condition:
-                  media_player.is_idle:
-                then:
-                  - media_player.speaker.play_on_device_media_file:
-                      media_file: intercom_ringing_sound
-                      announcement: true
+            - media_player.speaker.play_on_device_media_file:
+                media_file: intercom_ringing_sound
+                announcement: true
             - delay: 3s
 
   # Backlight timer
@@ -1831,7 +1769,6 @@ switch:
           format: "Mic mute ON — microphone silenced, MWW stopped"
       - micro_wake_word.stop:
       - microphone.mute: mic_aec
-      - microphone.mute: mic_raw
       - globals.set:
           id: voice_assistant_phase
           value: '${voice_assist_muted_phase_id}'
@@ -1842,7 +1779,6 @@ switch:
           tag: mute
           format: "Mic mute OFF — microphone active, MWW started"
       - microphone.unmute: mic_aec
-      - microphone.unmute: mic_raw
       - globals.set:
           id: voice_assistant_phase
           value: '${voice_assist_idle_phase_id}'
@@ -1946,7 +1882,58 @@ number:
       - lambda: |-
           float es8311_vol = 0.15 + (x / 100.0) * 0.60;
           id(es8311_dac).set_volume(es8311_vol);
-          id(i2s_duplex).set_aec_reference_volume(es8311_vol);
+
+
+# =============================================================================
+# Select Entities
+# =============================================================================
+select:
+  - platform: template
+    name: AEC Mode
+    id: aec_mode_select
+    icon: mdi:tune-vertical
+    options:
+      - "sr_low_cost"
+      - "sr_high_perf"
+      - "voip_low_cost"
+      - "voip_high_perf"
+    initial_option: "sr_low_cost"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - if:
+          condition:
+            lambda: 'return id(init_in_progress);'
+          then:
+            - logger.log: "AEC mode select: skipping during boot"
+          else:
+            - logger.log:
+                format: "Switching AEC mode to %s"
+                args: ['x.c_str()']
+            - lambda: |-
+                // Don't switch during active VA or intercom call
+                if (id(va).is_running() || !id(intercom).is_idle()) {
+                  ESP_LOGW("aec_mode", "Cannot switch AEC mode during active VA/intercom");
+                  return;
+                }
+                int mode = 0;
+                if (x == "sr_low_cost") mode = 0;
+                else if (x == "sr_high_perf") mode = 1;
+                else if (x == "voip_low_cost") mode = 3;
+                else if (x == "voip_high_perf") mode = 4;
+                id(i2s_duplex).stop();
+                if (!id(aec_component).reinit(static_cast<aec_mode_t>(mode))) {
+                  ESP_LOGE("aec_mode", "AEC reinit failed! Restarting with previous mode.");
+                }
+                id(i2s_duplex).start();
+            # Restart MWW — duplex stop resets mic_ref_count, MWW must re-register
+            - micro_wake_word.stop:
+            - delay: 300ms
+            - if:
+                condition:
+                  switch.is_off: mute
+                then:
+                  - micro_wake_word.start:
 
 # =============================================================================
 # TEXT SENSORS

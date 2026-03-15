@@ -62,8 +62,6 @@ esphome:
       - lambda: |-
           float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
           id(es8311_dac).set_volume(vol);
-          // AEC reference must match ES8311 hardware output level
-          id(i2s_duplex).set_aec_reference_volume(vol);
           id(peer_name) = id(intercom).get_current_destination();
       - script.execute: update_display_page
 
@@ -432,9 +430,6 @@ number:
           // ES8311 volume range: 0.15 (min) to 0.75 (max)
           float es8311_vol = 0.15 + (x / 100.0) * 0.60;
           id(es8311_dac).set_volume(es8311_vol);
-          // AEC reference must match ES8311 hardware output level
-          // This ensures reference amplitude matches actual echo picked up by mic
-          id(i2s_duplex).set_aec_reference_volume(es8311_vol);
 
 # ==============================================================================
 # TEXT SENSORS

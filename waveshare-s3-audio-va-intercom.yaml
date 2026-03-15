@@ -98,7 +98,6 @@ esphome:
       - lambda: |-
           float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
           id(es8311_dac).set_volume(vol);
-          id(i2s_duplex).set_aec_reference_volume(vol);
       - micro_wake_word.stop:
       - delay: 1s
       - micro_wake_word.start:
@@ -311,7 +310,10 @@ media_player:
       # Stop immediately to free resources — HA can re-send URL if needed.
       - media_player.stop:
     on_idle:
-      - delay: 200ms
+      # Immediately kill any LED effect (e.g., green Spin from playback)
+      # then let restore_led evaluate the correct state after drain.
+      - light.turn_off: status_led
+      - delay: 300ms
       - script.execute: restore_led
 
 # =============================================================================
@@ -1015,7 +1017,6 @@ number:
       - lambda: |-
           float es8311_vol = 0.15 + (x / 100.0) * 0.60;
           id(es8311_dac).set_volume(es8311_vol);
-          id(i2s_duplex).set_aec_reference_volume(es8311_vol);
 
 # =============================================================================
 # Select Entities
