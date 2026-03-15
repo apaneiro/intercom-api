@@ -22,11 +22,12 @@ With i2s_audio_duplex:
   - **Ring buffer** (default): Works with any codec. Speaker audio is copied to a delay buffer as reference. Configure `aec_reference_delay_ms` to match your acoustic path (typically 60-100ms). `aec_reference_volume` scales the reference to match hardware DAC volume.
   - **ES8311 Digital Feedback** (recommended for ES8311): Stereo I2S with L=DAC ref, R=ADC mic. Sample-accurate reference, no delay tuning needed. Enable with `use_stereo_aec_reference: true`. The digital loopback is post-DSP-volume — no `aec_reference_volume` scaling needed.
   - **TDM Hardware Reference** (for ES7210 + ES8311): ES7210 in TDM mode captures DAC analog output on a dedicated ADC channel (e.g. MIC3). Sample-aligned with mic data, no ring buffer delay. Enable with `use_tdm_reference: true`. The analog reference already reflects hardware volume — no scaling needed.
-- **Dual Mic Path**: `pre_aec` option for raw mic (MWW) alongside AEC-processed mic (VA/STT)
+- **Dual Mic Path**: `pre_aec` option for raw mic (diagnostics) alongside AEC-processed mic (VA/STT/MWW)
+- **PSRAM Buffers**: `buffers_in_psram` option moves all audio buffers to PSRAM (~28KB internal heap saved). ESP-IDF new I2S driver uses memcpy for user buffers (not DMA), so PSRAM is safe. Required for `sr_low_cost` AEC on memory-constrained devices.
 - **Volume Controls**: Mic gain (-20 to +30 dB, persistent), mic attenuation (pre-AEC), speaker volume, AEC reference volume
 - **Number Platform**: Native `mic_gain` and `speaker_volume` entities with `ESPPreferenceObject` persistence. When both `i2s_audio_duplex` and `intercom_api` are present, `i2s_audio_duplex` owns the number entities and `intercom_api` defers to avoid conflicts.
 - **Cross-Component Validation**: `FINAL_VALIDATE_SCHEMA` prevents dual AEC (both `i2s_audio_duplex` and `intercom_api` with `aec_id`) and dual DC offset removal, catching configuration errors at compile time
-- **AEC Gating**: Auto-disables AEC when speaker is silent (prevents filter drift)
+- **AEC Gating**: Auto-disables AEC when speaker is silent in mono/stereo modes (prevents filter drift). TDM mode is always-on (hardware ref captures silence naturally).
 - **Reference Counting**: Multiple mic consumers share the I2S bus safely (MWW + VA + intercom)
 - **CPU-Aware Scheduling**: `taskYIELD()` between frames for MWW inference headroom during AEC
 - **Multi-Rate Support**: Run I2S bus at 48kHz for high-quality DAC output while mic/AEC/VA operate at 16kHz via internal FIR decimation
@@ -54,11 +55,12 @@ graph TD
     spk_ref --> reference[reference]
     reference --> AEC
 
-    raw --> MWW
+    raw --> Diag[Diagnostics only]
 
     AEC --> post["mic_callbacks<br/>(mic_aec, post-AEC)"]
     post --> VA[Voice Assistant]
     post --> ICT[Intercom TX]
+    post --> MWW[Micro Wake Word]
 
     Mixer["mixer<br/>(VA TTS + Intercom RX)"] --> SPK[Speaker buffer]
     SPK --> VOL[volume scaling]
@@ -76,18 +78,18 @@ graph TD
 | `intercom_spk` | Core 0 | 4 | Network→speaker, AEC reference feed |
 | `intercom_srv` | Core 1 | 5 | TCP RX, call FSM (stays Core 1 for LVGL callback safety) |
 | `mixer` (ESPHome) | Any | 10 | Mix VA + intercom audio to speaker |
-| `MWW inference` (ESPHome) | Unpinned | 3 | Wake word TFLite micro inference |
+| `MWW inference` (ESPHome) | Unpinned | 3→**8** | Wake word TFLite inference (boost via on_boot lambda) |
 | ESPHome main loop / LVGL | Core 1 | 1 | Switches, sensors, display, etc. |
 | WiFi driver (ESP-IDF) | Core 0 | 23 | System — can briefly preempt audio_task |
 
 **Core allocation rationale:**
-- **Core 0**: All real-time audio (I2S + AEC + intercom processing). WiFi (prio 23) can briefly preempt `i2s_duplex` (prio 19) for sub-millisecond bursts — acceptable for 16ms frames with DMA buffering.
-- **Core 1**: LVGL display rendering + ESPHome main loop + intercom TCP. MWW (unpinned, prio 3) naturally schedules here since Core 0 is occupied by audio tasks, giving wake word inference a dedicated core free from AEC interference.
+- **Core 0**: Real-time audio (I2S + AEC). WiFi (prio 23) briefly preempts for sub-ms bursts.
+- **Core 1**: MWW inference + mixer + LVGL + ESPHome main loop. MWW priority boosted to 8 (above resampler/loopTask, below mixer) for reliable barge-in during TTS.
 
-**CPU budget** (256 samples @ 16kHz = 16ms per frame):
-- Without AEC: ~300µs processing (< 2% of a core)
-- With AEC active: ~7ms per frame (~42% of Core 0)
-- `taskYIELD()` after each frame yields Core 0 to `intercom_tx` and `intercom_spk` (I2S DMA provides natural blocking)
+**CPU budget** (sr_low_cost: 512 samples @ 16kHz = 32ms per frame):
+- Without AEC: ~300us processing (< 2% of a core)
+- With SR AEC active: ~22% of Core 0 (vs ~58% with VOIP mode)
+- IDLE headroom: Core 0 ~70%, Core 1 ~73% (measured with music + MWW + VA)
 
 ## Requirements
 
@@ -156,6 +158,7 @@ speaker:
 | `task_priority` | int | 19 | FreeRTOS priority of the audio task (1-24). Default 19 is above lwIP (18), below WiFi (23). |
 | `task_core` | int | 0 | Core affinity: 0 or 1 for pinned, -1 for unpinned. Default 0 follows Espressif AEC pattern. |
 | `task_stack_size` | int | 8192 | Audio task stack size in bytes (4096-32768). Increase if you see stack overflow warnings. |
+| `buffers_in_psram` | bool | false | Move all audio buffers (including I2S user buffers) to PSRAM. Saves ~28KB internal heap. Required for `sr_low_cost` AEC mode (512-sample frames). ESP-IDF new I2S driver uses memcpy for user buffers, not DMA. |
 
 ### Microphone Options
 
@@ -165,64 +168,73 @@ speaker:
 
 ### AEC with Voice Assistant + MWW
 
-When using AEC with both Voice Assistant and Micro Wake Word, create two microphone instances:
+Use `sr_low_cost` AEC mode for simultaneous VA + MWW. This mode uses a **linear-only adaptive filter** (Espressif `esp_aec3` engine) without the residual echo suppressor (RES) that VOIP modes add. The RES non-linear processing distorts spectral features that MWW's neural model relies on (confirmed: VOIP AEC = 2/10 detection, SR AEC = 10/10).
 
 ```yaml
 esp_aec:
   id: aec_component
   sample_rate: 16000
-  filter_length: 4      # 64ms tail (4 for integrated codec, 8 for separate mic+speaker)
-  mode: voip_low_cost    # Recommended for VA+MWW (same quality, lighter memory)
-  # AVOID sr_high_perf: exhausts DMA memory, causes SPI errors on ESP32-S3
+  filter_length: 4        # 64ms tail (4 for integrated codec, 8 for separate mic+speaker)
+  mode: sr_low_cost       # Linear-only AEC — preserves spectral features for MWW.
+                          # VOIP modes add RES that breaks MWW detection (esp-sr#159).
+                          # SR also uses ~60% less CPU (22% vs 58% Core 0).
+                          # Frame size: 512 samples (32ms) — requires buffers_in_psram.
 
 i2s_audio_duplex:
   id: i2s_duplex
   # ... pins ...
   aec_id: aec_component
-  use_stereo_aec_reference: true   # ES8311 only — reference is sample-aligned, no delay needed
+  buffers_in_psram: true  # Required for sr_low_cost (512-sample frames need more memory)
 
 microphone:
-  # Post-AEC: echo-cancelled audio for VA STT and intercom
+  # Post-AEC: echo-cancelled audio for VA STT, intercom, AND MWW
   - platform: i2s_audio_duplex
     id: mic_aec
     i2s_audio_duplex_id: i2s_duplex
 
-  # Pre-AEC: raw mic for wake word detection (hears voice through TTS echo)
+  # Pre-AEC: raw mic fallback (kept for diagnostics)
   - platform: i2s_audio_duplex
     id: mic_raw
     i2s_audio_duplex_id: i2s_duplex
     pre_aec: true
 
 micro_wake_word:
-  microphone: mic_raw     # Raw mic: detects wake word even during TTS
+  microphone: mic_aec     # Post-AEC: SR linear AEC preserves spectral features for neural MWW
 
 voice_assistant:
-  microphone: mic_aec     # AEC mic: clean STT without speaker echo
+  microphone: mic_aec     # Post-AEC: clean STT without speaker echo
 ```
 
-**Why two mics?** AEC suppresses all audio that correlates with the speaker reference — including your voice when you speak over TTS. MWW on post-AEC audio detects wake words only ~10% of the time during TTS. On raw mic, the neural model handles speaker echo much better than AEC-suppressed audio.
+**Why `sr_low_cost`?** Espressif's AEC has two completely different engines:
+- **SR modes** (`sr_low_cost`, `sr_high_perf`): `esp_aec3` — pure linear adaptive filter, no non-linear processing. Preserves audio spectral characteristics. ~22% CPU on Core 0.
+- **VOIP modes** (`voip_low_cost`, `voip_high_perf`): `dios_ssp_aec` — linear filter + two-stage residual echo suppressor (RES). Aggressively cleans audio for human listening but distorts features that neural models rely on. ~58% CPU on Core 0.
+
+Espressif engineer (esp-sr #159): *"For speech recognition and wake word models, adding the non-linear module reduces recognition accuracy."*
+
+**Why all on `mic_aec`?** With SR linear AEC, MWW detects reliably on post-AEC audio even during music/TTS playback. No need for separate `mic_raw` path. The echo is cancelled without distorting the wake word features.
 
 ### AEC CPU Impact
 
-The ESP-SR AEC (closed-source Espressif library) has a **fixed CPU cost per frame** regardless of `filter_length`. Costs vary significantly by mode (official ESP-SR benchmark on ESP32-S3):
+The ESP-SR AEC has two completely different engines with vastly different CPU profiles:
 
-| Mode | CPU Feed task | CPU Fetch task | Notes |
-|------|--------------|----------------|-------|
-| `sr_low_cost` | 8.4% | 15.0% | For speech recognition only (no speaker playing) |
-| `sr_high_perf` | 9.4% | 14.9% | **AVOID on ESP32-S3**: exhausts DMA memory → SPI err 101 |
-| `voip_low_cost` | ~60% | 8.2% | ✅ Recommended — full VoIP echo cancellation, least memory |
-| `voip_high_perf` | ~64% | 8.2% | Full VoIP, slightly heavier — no benefit over low_cost on S3 |
+| Mode | Engine | CPU (Core 0) | RES | MWW compatible |
+|------|--------|-------------|-----|----------------|
+| `sr_low_cost` | `esp_aec3_728` (linear, SIMD) | **~22%** | No | **Yes** (10/10 detection) |
+| `sr_high_perf` | `esp_aec3_hps16fft` (linear, FFT) | ~25% | No | Yes |
+| `voip_low_cost` | `dios_ssp_aec` (Speex-based) | **~58%** | Yes (always) | **No** (2/10 detection) |
+| `voip_high_perf` | `dios_ssp_aec` | ~64% | Yes (always) | No |
 
-**Use `voip_low_cost`** for any setup where the speaker plays while the mic is active (VA, intercom, radio). The SR modes are designed for noise suppression only (no active speaker) and have better CPU numbers but inadequate echo cancellation for full-duplex use.
+**Use `sr_low_cost`** for VA + MWW + intercom. It provides effective echo cancellation while preserving spectral features for neural wake word detection, at 60% less CPU than VOIP modes.
 
-| Metric | Value |
-|--------|-------|
-| Frame size | 256 samples (16ms at 16kHz) |
-| AEC processing time | ~7ms avg, ~10ms peak |
-| CPU per core | ~42% of Core 0 |
-| `filter_length` impact on CPU | None (tested: 4 vs 8 = identical) |
+| Metric | sr_low_cost | voip_low_cost |
+|--------|------------|---------------|
+| Frame size | 512 samples (32ms) | 256 samples (16ms) |
+| CPU (Core 0) | ~22% | ~58% |
+| MWW detection | 10/10 | 2/10 |
+| Echo cancellation | Linear only | Linear + RES |
+| Requires `buffers_in_psram` | Yes (on S3) | No |
 
-**MWW + AEC coexistence**: With `i2s_duplex` on Core 0 (prio 19), MWW (unpinned, prio 3) naturally schedules to Core 1 where it has no competition from AEC. This achieves 10/10 wake word detection even during active TTS. The `taskYIELD()` in `audio_task` yields Core 0 to intercom tasks between frames.
+**MWW + AEC coexistence**: With `sr_low_cost`, MWW uses the same `mic_aec` (post-AEC) as VA and intercom. The linear AEC removes echo without distorting spectral features. MWW task priority can be boosted from default 3 to 8 via `on_boot` lambda for reliable barge-in during TTS playback.
 
 ### ES8311 Digital Feedback AEC (Recommended)
 
@@ -280,8 +292,9 @@ esphome:
           // TDM mode enable
           data[0] = 0x12; data[1] = 0x02;
           id(i2c_bus).write(0x40, data, 2);
-          // MIC3 gain 0dB (for clean reference)
-          data[0] = 0x45; data[1] = 0x10;
+          // MIC3 gain 30dB (Espressif Korvo-2 reference: GAIN_30DB for AEC ref)
+          // DAC→MIC3 path has 2.2K series + filter (~1.7dB attenuation), needs gain.
+          data[0] = 0x45; data[1] = 0x1A;
           id(i2c_bus).write(0x40, data, 2);
 ```
 
@@ -546,10 +559,10 @@ binary_sensor:
 - **Speaker Buffer**: 8192 bytes ring buffer (~256ms at 16kHz mono), scales with decimation ratio (24576 bytes at 48kHz)
 - **Task Priority**: 19 (above lwIP at 18, below WiFi at 23). Configurable via `task_priority` YAML option.
 - **Core Affinity**: Pinned to Core 0 (canonical Espressif AEC pattern; frees Core 1 for MWW inference and LVGL). Configurable via `task_core` YAML option.
-- **AEC Gating**: Processes AEC only when speaker had real audio within last 250ms
+- **AEC Gating**: Mono/stereo modes process AEC only when speaker had real audio within last 250ms. TDM mode is always-on (hardware ref captures silence naturally, no filter drift).
 - **Thread Safety**: All cross-thread variables use `std::atomic` with `memory_order_relaxed` — including `float` volumes (`mic_gain_`, `mic_attenuation_`, `speaker_volume_`, `aec_ref_volume_`). A **snapshot pattern** loads all atomics once per 16ms frame into local `AudioTaskCtx` fields, avoiding repeated `.load()` in sample loops. Ring buffer resets use atomic request flags (`request_speaker_reset_`, `request_ref_prefill_`) to avoid concurrent access between main thread and audio task.
 - **Task Structure**: `audio_task_()` is split into `process_rx_path_()`, `process_aec_and_callbacks_()`, and `process_tx_path_()`, sharing state via `AudioTaskCtx` struct. AEC buffers use 16-byte aligned allocation for ESP-SR SIMD safety.
-- **Mic Gain**: -20 to +30 dB range (applied post-AEC in audio_task). Stored via `ESPPreferenceObject` and restored on boot. The gain does NOT affect wake word detection (MWW receives pre-AEC audio).
+- **Mic Gain**: -20 to +30 dB range (applied post-AEC in audio_task). Stored via `ESPPreferenceObject` and restored on boot. Mic gain is applied to post-AEC output (affects VA/intercom/MWW equally).
 - **Cross-Component Validation**: `FINAL_VALIDATE_SCHEMA` checks at compile time that `i2s_audio_duplex` and `intercom_api` don't both configure AEC (`aec_id`) or DC offset removal. If both components are present, `i2s_audio_duplex` takes ownership of AEC and DC offset processing; `intercom_api` should NOT set `aec_id` or `dc_offset_removal`.
 
 ### PSRAM and sdkconfig Requirements
@@ -602,17 +615,20 @@ Removing any of these causes audio glitch at stream startup (cache cold-start: e
 4. Check DMA buffer size — at 4 slots, `dma_frame_num` should be 256 (2048 bytes/descriptor, under 4092 limit)
 
 ### MWW Not Detecting During TTS
-1. Use `pre_aec: true` microphone for MWW (raw mic, not AEC-processed) — AEC suppresses voice during TTS
-2. Verify `i2s_duplex` task is on **Core 0** (prio 19). MWW (unpinned, prio 3) will then schedule to Core 1, away from AEC. With the wrong core assignment, MWW gets starved for 7ms out of every 16ms frame → ~1/10 detection rate.
-3. Do NOT use `sr_high_perf` AEC mode — it causes SPI errors and the lighter CPU cost is not worth the loss of echo cancellation during TTS.
+1. **Use `sr_low_cost` AEC mode** (not `voip_low_cost`). VOIP modes add a residual echo suppressor that distorts spectral features MWW relies on (2/10 detection vs 10/10 with SR). See [AEC CPU Impact](#aec-cpu-impact).
+2. **MWW on `mic_aec`** (post-AEC), NOT `mic_raw`. With SR linear AEC, post-AEC audio preserves wake word features while removing echo.
+3. **Enable `buffers_in_psram: true`** — required for SR mode's 512-sample frames on ESP32-S3.
+4. **Boost MWW priority to 8** via on_boot lambda (ESPHome defaults to 3, below mixer at 10).
+5. Do NOT use `sr_high_perf` — exhausts DMA memory on ESP32-S3.
 
 ### Switches/Display Slow With AEC On
 With `i2s_duplex` on **Core 0**, AEC no longer competes with LVGL/display on Core 1. This issue is resolved by correct core assignment. If you still see display slowness, check that no other high-priority task is pinned to Core 1.
 
 ### SPI Errors (err 101) With AEC
-1. Use `mode: voip_low_cost` — `sr_high_perf` exhausts DMA memory on ESP32-S3
-2. Reduce display update interval (500ms+) to avoid SPI bus contention
-3. Check free heap in logs after boot
+1. Use `mode: sr_low_cost` or `mode: voip_low_cost` — `sr_high_perf` exhausts DMA memory on ESP32-S3
+2. Enable `buffers_in_psram: true` to free internal heap
+3. Reduce display update interval (500ms+) to avoid SPI bus contention
+4. Check free heap in logs after boot
 
 ## Known Limitations
 

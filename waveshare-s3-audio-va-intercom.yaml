@@ -19,11 +19,17 @@
 # Audio pipeline (i2s_audio_duplex at 48kHz, TDM + FIR decimation to 16kHz):
 #
 #   ES7210 TDM slot 0 (MIC1)         → FIR x3 ──┐
-#   ES7210 TDM slot 1 (MIC3=DAC ref) → FIR x3 ──┼── AEC → mic_aec → VA / Intercom TX / MWW
+#   ES7210 TDM slot 1 (MIC3=DAC ref) → FIR x3 ──┼── AEC (SR linear) → mic_aec → VA / Intercom TX / MWW
+#                                                 └── mic_raw (pre-AEC, diagnostics only)
 #
-#   Music/radio → media_speaker (resampler) ────────────┐
+#   Music/radio → media_speaker (resampler) ───────────┐
 #   VA TTS      → tts_speaker (resampler) ─────────────┼── mixer (48kHz) → hw_speaker → ES8311 DAC
 #   Intercom RX → intercom_speaker (resampler) ────────┘
+#
+# AEC mode: sr_low_cost (linear adaptive filter, no residual echo suppressor).
+#   VOIP modes add non-linear RES that distorts spectral features, breaking MWW
+#   neural detection (confirmed: VOIP AEC=2/10, SR AEC=10/10, Espressif esp-sr#159).
+#   SR mode also uses ~60% less CPU than VOIP (22% vs 58% on Core 0).
 #
 # Buttons:
 #   GPIO0 (BOOT): Single click = call_toggle / VA start-stop
@@ -200,9 +206,12 @@ audio_adc:
 esp_aec:
   id: aec_processor
   sample_rate: 16000       # AEC always at 16kHz (= output_sample_rate)
-  mode: sr_low_cost
-  filter_length: 4         # 64ms tail — sufficient for integrated codec path
-  # AVOID sr_high_perf: exhausts DMA memory on ESP32-S3 → SPI err 101
+  mode: sr_low_cost        # Linear-only AEC (esp_aec3 engine, no residual echo suppressor).
+                           # Preserves spectral features for MWW neural detection.
+                           # VOIP modes use dios_ssp_aec with RES that distorts MWW (2/10 vs 10/10).
+                           # SR also uses ~60% less CPU (22% vs 58%).
+                           # Frame size: 512 samples (32ms) — requires buffers_in_psram on S3.
+  filter_length: 4         # 64ms echo tail — sufficient for integrated codec path (ES8311+ES7210)
 
 i2s_audio_duplex:
   id: i2s_duplex
@@ -218,14 +227,15 @@ i2s_audio_duplex:
   tdm_total_slots: 4
   tdm_mic_slot: 0              # ES7210 TDM slot 0 = ADC1 (MIC1, voice)
   tdm_ref_slot: 1              # ES7210 TDM slot 1 = ADC3 (MIC3, ES8311 DAC feedback)
-  buffers_in_psram: true       # Non-DMA buffers in PSRAM (saves ~15KB internal RAM)
+  buffers_in_psram: true       # All audio buffers in PSRAM (~28KB saved). ESP-IDF new I2S driver
+                               # uses memcpy (not DMA) for user buffers. Required for sr_low_cost
+                               # (512-sample frames need larger buffers than internal heap allows).
 
 # =============================================================================
 # Microphone (ES7210 ADC, 16kHz output after FIR decimation)
 # =============================================================================
-# mic_aec: post-AEC for VA STT and intercom TX (clean audio, no speaker echo)
-# mic_raw: pre-AEC for MWW (raw signal — AEC suppresses voice during TTS,
-#          making wake word detection unreliable; neural MWW handles echo better)
+# mic_aec: post-AEC for VA STT, intercom TX, AND MWW (SR linear AEC preserves spectral features)
+# mic_raw: pre-AEC fallback (kept for diagnostics; not used in normal operation)
 microphone:
   - platform: i2s_audio_duplex
     id: mic_aec
@@ -1151,15 +1161,25 @@ interval:
   - interval: 10s
     then:
       - lambda: |-
-          // Per-task CPU usage
-          char *buf = (char *)malloc(2048);
-          if (buf) {
-            vTaskGetRunTimeStats(buf);
-            ESP_LOGI("task_cpu", "\n%s", buf);
-            free(buf);
+          // Per-task CPU + priority + stack watermark
+          UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
+          TaskStatus_t *tasks = (TaskStatus_t *)malloc(num_tasks * sizeof(TaskStatus_t));
+          if (tasks) {
+            uint32_t total_runtime;
+            UBaseType_t got = uxTaskGetSystemState(tasks, num_tasks, &total_runtime);
+            ESP_LOGI("telemetry", "--- Task dump (%u tasks, total_rt=%u) ---", (unsigned)got, (unsigned)total_runtime);
+            for (UBaseType_t i = 0; i < got; i++) {
+              uint32_t pct = (total_runtime > 0) ? (tasks[i].ulRunTimeCounter * 100) / total_runtime : 0;
+              ESP_LOGI("telemetry", "  %-16s prio=%2u stack_free=%4u cpu=%2u%%",
+                       tasks[i].pcTaskName,
+                       (unsigned)tasks[i].uxCurrentPriority,
+                       (unsigned)tasks[i].usStackHighWaterMark,
+                       (unsigned)pct);
+            }
+            free(tasks);
           }
           // Memory stats
-          ESP_LOGI("task_cpu", "Heap: internal=%u (min=%u) PSRAM=%u",
+          ESP_LOGI("telemetry", "Heap: internal=%u (min=%u) PSRAM=%u",
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
