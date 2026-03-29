@@ -1448,9 +1448,9 @@ script:
           condition:
             binary_sensor.is_on: is_idle_screen
           then:
-            - script.execute: switch_to_va
-          else:
             - script.execute: switch_to_intercom
+          else:
+            - script.execute: switch_to_va
 
 # =============================================================================
 # BUTTONS
